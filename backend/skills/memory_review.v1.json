@@ -1,0 +1,7 @@
+{
+  "name": "memory_review",
+  "version": "1.0.0",
+  "agent": "master-dispatcher-agent",
+  "tools": ["search_curated_memory", "propose_memory", "request_human_curation"],
+  "forbidden": ["auto_curate_external_memory", "share_memory_with_worker"]
+}

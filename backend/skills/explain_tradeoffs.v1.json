@@ -1,0 +1,7 @@
+{
+  "name": "explain_tradeoffs",
+  "version": "1.0.0",
+  "agent": "master-dispatcher-agent",
+  "tools": ["read_computed_evidence", "read_policy_decision", "structured_response"],
+  "forbidden": ["alter_solver_result", "activate_plan", "approve_action", "send_driver_message"]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "approval_coordination",
+  "version": "1.0.0",
+  "agent": "master-dispatcher-agent",
+  "tools": ["read_policy_decision", "create_approval_request", "read_approval_status"],
+  "forbidden": ["approve_action", "forge_proof", "bypass_policy", "activate_plan"]
+}

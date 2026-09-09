@@ -1,0 +1,14 @@
+.env
+.env.generated-secrets
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+artifacts/
+.playwright-cli/
+output/
+frontend/node_modules/
+frontend/.vinext/
+frontend/dist/
+frontend/.wrangler/
+*.pyc

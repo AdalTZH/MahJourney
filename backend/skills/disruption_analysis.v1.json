@@ -1,0 +1,7 @@
+{
+  "name": "disruption_analysis",
+  "version": "1.0.0",
+  "agent": "disruption-analyst-agent",
+  "tools": ["traffic_intersection", "weather_intersection", "bounded_replan_request"],
+  "forbidden": ["edit_plan", "activate_plan", "approve_action", "master_memory"]
+}

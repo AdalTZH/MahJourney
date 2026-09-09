@@ -1,0 +1,99 @@
+name: mahjourney
+services:
+  db:
+    build:
+      context: ./database
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mahjourney}
+      POSTGRES_USER: ${POSTGRES_USER:-mahjourney}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mahjourney} -d ${POSTGRES_DB:-mahjourney}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    cpus: 0.45
+    mem_limit: 1g
+    restart: unless-stopped
+
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mahjourney}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-mahjourney}
+      PERSISTENCE_ENABLED: "true"
+      APP_SESSION_SECRET: ${APP_SESSION_SECRET:-development-only-session-secret}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-development-only-webhook-secret}
+      ENROLLMENT_TOKEN_PEPPER: ${ENROLLMENT_TOKEN_PEPPER:-development-only-enrollment-pepper}
+      AUDIT_CHAIN_HMAC_KEY: ${AUDIT_CHAIN_HMAC_KEY:-development-only-audit-key}
+      APPROVAL_ACTION_HMAC_KEY: ${APPROVAL_ACTION_HMAC_KEY:-development-only-approval-key}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    cpus: 0.65
+    mem_limit: 768m
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "mahjourney.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mahjourney}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-mahjourney}
+    depends_on:
+      db:
+        condition: service_healthy
+    cpus: 0.4
+    mem_limit: 512m
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api/v1}
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: /api/v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/dispatcher').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    cpus: 0.4
+    mem_limit: 768m
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      APP_PUBLIC_HOST: ${APP_PUBLIC_HOST:-http://localhost}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    cpus: 0.1
+    mem_limit: 128m
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

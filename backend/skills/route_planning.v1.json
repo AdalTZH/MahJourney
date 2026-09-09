@@ -1,0 +1,7 @@
+{
+  "name": "route_planning",
+  "version": "1.0.0",
+  "agent": "route-planning-agent",
+  "tools": ["geocode", "cost_matrix", "ortools", "validate_plan", "monte_carlo"],
+  "forbidden": ["activate_plan", "approve_action", "send_driver_message", "master_memory"]
+}
