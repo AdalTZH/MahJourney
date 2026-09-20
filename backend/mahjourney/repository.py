@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
@@ -10,10 +11,52 @@ from .domain import (
     ApprovalRequest,
     AuditEvent,
     ConversationMessage,
+    Coordinate,
+    Depot,
     DisruptionEvent,
+    Driver,
     MemoryItem,
+    Order,
     PlanVersion,
+    Vehicle,
 )
+from .operational_data import split_skills
+
+
+def _pair_drivers_by_shift(drivers: tuple[Driver, ...]) -> dict[str, list[Driver]]:
+    """Order each depot's drivers so vehicles get spread across shifts.
+
+    Vehicles are paired to drivers by popping from the front of each depot's
+    list. If drivers were left in id order, one shift (whichever sorts first)
+    could claim every vehicle and leave the depot's evening drivers unused. To
+    avoid that, drivers are grouped by their (start, end) shift and then
+    interleaved round-robin across shift groups. With, say, 4 day-shift and 1
+    evening driver at a depot with 4 vehicles, the evening driver is picked up
+    on the second assignment instead of last, giving the depot real evening
+    coverage from the drivers it already has.
+    """
+    by_depot: dict[str, dict[tuple[int, int], list[Driver]]] = {}
+    for driver in drivers:
+        shift = (driver.working_start_minute, driver.working_end_minute)
+        by_depot.setdefault(driver.depot_id, {}).setdefault(shift, []).append(driver)
+
+    ordered: dict[str, list[Driver]] = {}
+    for depot_id, shift_groups in by_depot.items():
+        # Sort shift groups by latest end first so evening shifts are offered
+        # early; sort drivers within a shift by id for determinism.
+        groups = [
+            sorted(group, key=lambda d: d.driver_id)
+            for _, group in sorted(shift_groups.items(), key=lambda item: -item[0][1])
+        ]
+        interleaved: list[Driver] = []
+        index = 0
+        while any(index < len(group) for group in groups):
+            for group in groups:
+                if index < len(group):
+                    interleaved.append(group[index])
+            index += 1
+        ordered[depot_id] = interleaved
+    return ordered
 
 
 class PostgresRepository:
@@ -230,6 +273,68 @@ class PostgresRepository:
         async with self.engine.begin() as connection:
             await connection.execute(statement, values)
 
+    async def load_telegram_drivers(self) -> tuple[dict[str, Any], ...]:
+        statement = text(
+            """
+            SELECT driver_id, telegram_user_id, enrollment_digest,
+                   enrollment_expires_at, enrollment_used_at, suspended_at
+            FROM telegram_drivers
+            """
+        )
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(statement)).mappings().all()
+            return tuple(dict(row) for row in rows)
+
+    async def save_telegram_enrollment(
+        self, driver_id: str, digest: str, expires_at: datetime
+    ) -> None:
+        """Persist a freshly issued (not yet used) enrollment token digest."""
+        statement = text(
+            """
+            INSERT INTO telegram_drivers(driver_id, enrollment_digest, enrollment_expires_at)
+            VALUES (:driver_id, :digest, :expires_at)
+            ON CONFLICT (driver_id) DO UPDATE
+            SET enrollment_digest = EXCLUDED.enrollment_digest,
+                enrollment_expires_at = EXCLUDED.enrollment_expires_at,
+                enrollment_used_at = NULL
+            """
+        )
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                statement, {"driver_id": driver_id, "digest": digest, "expires_at": expires_at}
+            )
+
+    async def bind_telegram_driver(self, driver_id: str, telegram_user_id: int) -> None:
+        """Record a successful enrollment: bind the Telegram user and mark it used.
+
+        Upserts rather than updating in place so a binding is still recorded
+        even if the issuing row was written before persistence was enabled.
+        """
+        statement = text(
+            """
+            INSERT INTO telegram_drivers(driver_id, telegram_user_id, enrollment_used_at)
+            VALUES (:driver_id, :telegram_user_id, now())
+            ON CONFLICT (driver_id) DO UPDATE
+            SET telegram_user_id = EXCLUDED.telegram_user_id,
+                enrollment_used_at = EXCLUDED.enrollment_used_at
+            """
+        )
+        async with self.engine.begin() as connection:
+            await connection.execute(
+                statement, {"driver_id": driver_id, "telegram_user_id": telegram_user_id}
+            )
+
+    async def suspend_telegram_driver(self, driver_id: str) -> None:
+        statement = text(
+            """
+            INSERT INTO telegram_drivers(driver_id, suspended_at)
+            VALUES (:driver_id, now())
+            ON CONFLICT (driver_id) DO UPDATE SET suspended_at = EXCLUDED.suspended_at
+            """
+        )
+        async with self.engine.begin() as connection:
+            await connection.execute(statement, {"driver_id": driver_id})
+
     async def load_audit_events(self) -> tuple[AuditEvent, ...]:
         statement = text(
             """
@@ -354,6 +459,190 @@ class PostgresRepository:
             versions.append(row["observed_at"])
         version = max(versions).isoformat() if versions else None
         return speeds, version
+
+    async def load_depots(self) -> tuple[Depot, ...]:
+        statement = text(
+            """
+            SELECT depot_id, name, latitude, longitude, delivery_area,
+                   operating_start_minute, operating_end_minute, cold_storage, status
+            FROM depots ORDER BY depot_id
+            """
+        )
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(statement)).mappings().all()
+        return tuple(
+            Depot(
+                depot_id=str(row["depot_id"]),
+                name=row["name"],
+                location=Coordinate(lat=row["latitude"], lon=row["longitude"]),
+                delivery_area=row["delivery_area"],
+                operating_start_minute=row["operating_start_minute"],
+                operating_end_minute=row["operating_end_minute"],
+                cold_storage=row["cold_storage"],
+                status=row["status"],
+            )
+            for row in rows
+        )
+
+    async def load_drivers(self, available_only: bool = False) -> tuple[Driver, ...]:
+        statement = text(
+            """
+            SELECT driver_id, name, depot_id, license_type, vocational_license,
+                   certification_type, working_start_minute, working_end_minute,
+                   shift_type, skill_set, availability_status
+            FROM drivers
+            WHERE (:available_only = FALSE OR availability_status = 'Available')
+            ORDER BY driver_id
+            """
+        )
+        async with self.engine.connect() as connection:
+            rows = (
+                await connection.execute(statement, {"available_only": available_only})
+            ).mappings().all()
+        return tuple(
+            Driver(
+                driver_id=str(row["driver_id"]),
+                name=row["name"],
+                depot_id=str(row["depot_id"]) if row["depot_id"] is not None else "",
+                license_type=row["license_type"],
+                vocational_license=row["vocational_license"],
+                certification_type=row["certification_type"],
+                working_start_minute=row["working_start_minute"],
+                working_end_minute=row["working_end_minute"],
+                shift_type=row["shift_type"],
+                skill_set=split_skills(row["skill_set"]),
+                availability_status=row["availability_status"],
+            )
+            for row in rows
+        )
+
+    async def load_orders(self, pending_only: bool = True) -> tuple[Order, ...]:
+        statement = text(
+            """
+            SELECT order_id, delivery_address, postal_code, latitude, longitude, delivery_area,
+                   window_start_minute, window_end_minute, priority_level, quantity,
+                   weight_kg, volume_m3, special_handling, customer_name, contact_phone,
+                   order_status
+            FROM orders
+            WHERE (:pending_only = FALSE OR order_status = 'Pending Dispatch')
+            ORDER BY order_id
+            """
+        )
+        async with self.engine.connect() as connection:
+            rows = (
+                await connection.execute(statement, {"pending_only": pending_only})
+            ).mappings().all()
+        orders = []
+        for row in rows:
+            handling = (row["special_handling"] or "None").strip()
+            cargo_tags = () if handling in ("", "None") else (handling,)
+            orders.append(
+                Order(
+                    order_id=str(row["order_id"]),
+                    address=row["delivery_address"],
+                    postal_code=row["postal_code"] or "",
+                    location=Coordinate(lat=row["latitude"], lon=row["longitude"]),
+                    demand=max(1, int(row["quantity"])),
+                    service_seconds=300,
+                    window_start_minute=row["window_start_minute"],
+                    window_end_minute=row["window_end_minute"],
+                    cargo_tags=cargo_tags,
+                    weight_kg=row["weight_kg"],
+                    volume_m3=row["volume_m3"],
+                    quantity=max(1, int(row["quantity"])),
+                    delivery_area=row["delivery_area"],
+                    special_handling=handling or "None",
+                    priority_level=int(row["priority_level"]),
+                    customer_name=row["customer_name"],
+                    contact_phone=row["contact_phone"],
+                )
+            )
+        return tuple(orders)
+
+    async def load_fleet(self, available_only: bool = True) -> tuple[Vehicle, ...]:
+        """Load vehicles and pair each with an Available driver at its depot.
+
+        The vehicle's working window is the intersection of its own availability
+        window and the assigned driver's working hours. Vehicles without an
+        eligible driver at the same depot are excluded, because a vehicle cannot
+        run a route without a driver.
+        """
+        statement = text(
+            """
+            SELECT vehicle_id, license_plate, vehicle_type, lta_vehicle_class, fuel_type,
+                   capacity_weight_kg, capacity_volume_m3, depot_id,
+                   current_latitude, current_longitude,
+                   availability_start_minute, availability_end_minute,
+                   refrigeration_capability, vehicle_availability
+            FROM vehicles
+            WHERE (:available_only = FALSE OR vehicle_availability = 'Available')
+            ORDER BY vehicle_id
+            """
+        )
+        async with self.engine.connect() as connection:
+            rows = (
+                await connection.execute(statement, {"available_only": available_only})
+            ).mappings().all()
+
+        drivers = await self.load_drivers(available_only=available_only)
+        drivers_by_depot = _pair_drivers_by_shift(drivers)
+
+        vehicles: list[Vehicle] = []
+        for row in rows:
+            depot_id = str(row["depot_id"]) if row["depot_id"] is not None else ""
+            pool = drivers_by_depot.get(depot_id)
+            if not pool:
+                continue
+            driver = pool.pop(0)  # one driver per vehicle, same depot
+            working_start = max(row["availability_start_minute"], driver.working_start_minute)
+            working_end = min(row["availability_end_minute"], driver.working_end_minute)
+            if working_start >= working_end:
+                working_start, working_end = driver.working_start_minute, driver.working_end_minute
+            vehicles.append(
+                Vehicle(
+                    vehicle_id=str(row["vehicle_id"]),
+                    driver_id=driver.driver_id,
+                    start=Coordinate(lat=row["current_latitude"], lon=row["current_longitude"]),
+                    depot_id=depot_id,
+                    capacity_weight_kg=row["capacity_weight_kg"],
+                    capacity_volume_m3=row["capacity_volume_m3"],
+                    vehicle_type=row["vehicle_type"],
+                    license_plate=row["license_plate"],
+                    lta_vehicle_class=row["lta_vehicle_class"],
+                    fuel_type=row["fuel_type"],
+                    refrigerated=row["refrigeration_capability"],
+                    availability_start_minute=row["availability_start_minute"],
+                    availability_end_minute=row["availability_end_minute"],
+                    availability_status=row["vehicle_availability"],
+                    working_start_minute=working_start,
+                    working_end_minute=working_end,
+                )
+            )
+        return tuple(vehicles)
+
+    async def _fetch_records(self, table: str, order_by: str) -> tuple[dict[str, Any], ...]:
+        # ``table`` and ``order_by`` are module-controlled constants, never user
+        # input, so interpolation here is safe from injection.
+        statement = text(f"SELECT * FROM {table} ORDER BY {order_by}")  # noqa: S608
+        async with self.engine.connect() as connection:
+            rows = (await connection.execute(statement)).mappings().all()
+        records = []
+        for row in rows:
+            record = {key: value for key, value in dict(row).items() if key != "location"}
+            records.append(record)
+        return tuple(records)
+
+    async def list_orders_raw(self) -> tuple[dict[str, Any], ...]:
+        return await self._fetch_records("orders", "order_id")
+
+    async def list_vehicles_raw(self) -> tuple[dict[str, Any], ...]:
+        return await self._fetch_records("vehicles", "vehicle_id")
+
+    async def list_drivers_raw(self) -> tuple[dict[str, Any], ...]:
+        return await self._fetch_records("drivers", "driver_id")
+
+    async def list_depots_raw(self) -> tuple[dict[str, Any], ...]:
+        return await self._fetch_records("depots", "depot_id")
 
     async def close(self) -> None:
         await self.engine.dispose()

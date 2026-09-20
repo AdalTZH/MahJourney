@@ -15,7 +15,8 @@ def test_audit_chain_detects_tampering() -> None:
 
 def test_enrollment_is_private_single_use_and_scoped() -> None:
     service = EnrollmentService("pepper")
-    token = service.issue("DRV-01")
+    token, digest, expires_at = service.issue("DRV-01")
+    assert digest and expires_at
     with pytest.raises(PermissionError):
         service.enroll(token, 42, "group")
     assert service.enroll(token, 42, "private") == "DRV-01"
@@ -24,6 +25,42 @@ def test_enrollment_is_private_single_use_and_scoped() -> None:
     assert service.driver_for(42) is None
     with pytest.raises(PermissionError):
         service.enroll(token, 43, "private")
+
+
+def test_enrollment_telegram_user_for_is_reverse_lookup() -> None:
+    service = EnrollmentService("pepper")
+    token, _digest, _expires_at = service.issue("DRV-01")
+    service.enroll(token, 42, "private")
+    assert service.telegram_user_for("DRV-01") == 42
+    assert service.telegram_user_for("DRV-02") is None
+    service.suspend("DRV-01")
+    assert service.telegram_user_for("DRV-01") is None
+
+
+def test_enrollment_restore_rehydrates_bindings_and_suspensions() -> None:
+    service = EnrollmentService("pepper")
+    service.restore(
+        (
+            {
+                "driver_id": "DRV-01",
+                "telegram_user_id": 42,
+                "enrollment_digest": None,
+                "enrollment_expires_at": None,
+                "enrollment_used_at": "2026-01-01T00:00:00Z",
+                "suspended_at": None,
+            },
+            {
+                "driver_id": "DRV-02",
+                "telegram_user_id": None,
+                "enrollment_digest": None,
+                "enrollment_expires_at": None,
+                "enrollment_used_at": None,
+                "suspended_at": "2026-01-01T00:00:00Z",
+            },
+        )
+    )
+    assert service.driver_for(42) == "DRV-01"
+    assert "DRV-02" in service._suspended
 
 
 def test_x401_proof_is_exact_and_not_replayable() -> None:

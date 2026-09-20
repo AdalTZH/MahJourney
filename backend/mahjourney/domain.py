@@ -21,22 +21,76 @@ class Coordinate(FrozenModel):
     lon: float = Field(ge=103.55, le=104.1)
 
 
+class Depot(FrozenModel):
+    depot_id: str
+    name: str = ""
+    location: Coordinate
+    delivery_area: str = ""
+    operating_start_minute: int = 0
+    operating_end_minute: int = 1439
+    cold_storage: bool = False
+    status: str = "Operational"
+
+
+class Driver(FrozenModel):
+    driver_id: str
+    name: str = ""
+    depot_id: str = ""
+    license_type: str = ""
+    vocational_license: str = ""
+    certification_type: str = ""
+    working_start_minute: int = 480
+    working_end_minute: int = 1080
+    shift_type: str = ""
+    skill_set: tuple[str, ...] = ()
+    availability_status: str = "Available"
+
+
 class Vehicle(FrozenModel):
     vehicle_id: str
     driver_id: str
-    capacity: int = Field(gt=0)
+    # ``capacity`` is retained as an abstract stop/demand ceiling for backward
+    # compatibility with the synthetic fixtures and existing tests. Realistic
+    # planning uses the weight/volume dimensions below.
+    capacity: int = Field(default=25, gt=0)
     start: Coordinate
+    depot_id: str = ""
+    capacity_weight_kg: float = Field(default=1_000_000.0, gt=0)
+    capacity_volume_m3: float = Field(default=1_000_000.0, gt=0)
+    vehicle_type: str = ""
+    license_plate: str = ""
+    lta_vehicle_class: str = ""
+    fuel_type: str = ""
+    refrigerated: bool = False
+    availability_start_minute: int = 0
+    availability_end_minute: int = 1439
+    availability_status: str = "Available"
+    # Working window narrowed by the assigned driver's shift; defaults to the
+    # vehicle's own availability window when no driver constraint applies.
+    working_start_minute: int = 480
+    working_end_minute: int = 1080
 
 
 class Order(FrozenModel):
     order_id: str
     address: str
+    postal_code: str = ""
     location: Coordinate
-    demand: int = Field(gt=0)
+    demand: int = Field(default=1, gt=0)
     service_seconds: int = 300
     window_start_minute: int = 480
     window_end_minute: int = 1080
     cargo_tags: tuple[str, ...] = ()
+    weight_kg: float = Field(default=1.0, ge=0)
+    volume_m3: float = Field(default=0.0, ge=0)
+    quantity: int = Field(default=1, ge=1)
+    delivery_area: str = ""
+    special_handling: str = "None"
+    priority_level: int = 3
+    customer_name: str = ""
+    contact_phone: str = ""
+    assigned_depot_id: str = ""
+    assignment_note: str = ""
 
 
 class RouteStop(FrozenModel):

@@ -257,3 +257,54 @@ class NeaClient:
             return WeatherSnapshot(
                 dataset=dataset, response_hash="", status=SnapshotStatus.FETCH_FAILED
             )
+
+
+class TelegramClient:
+    """Thin wrapper around the Telegram Bot API for outbound driver messages."""
+
+    BASE_URL = "https://api.telegram.org"
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        self.settings = settings
+        self.client = client or httpx.AsyncClient(timeout=10)
+
+    async def send_message(
+        self, chat_id: int, text: str, parse_mode: str | None = None
+    ) -> bool:
+        """Send a message to a Telegram chat. Returns whether it was sent.
+
+        Returns False (never raises) when no bot token is configured, so
+        callers in the plan-activation path can send-best-effort without a
+        missing credential ever failing plan activation itself. Retries 429
+        and 5xx responses a few times with backoff, matching the pattern used
+        by the other integration clients in this module. Pass
+        ``parse_mode="HTML"`` to use Telegram's limited HTML subset (e.g. for
+        a monospace ``<pre>`` block); callers are responsible for escaping
+        ``<``, ``>``, and ``&`` in any text rendered that way.
+        """
+        if not self.settings.telegram_bot_token:
+            return False
+        url = f"{self.BASE_URL}/bot{self.settings.telegram_bot_token}/sendMessage"
+        payload: dict[str, object] = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        for attempt in range(3):
+            try:
+                response = await self.client.post(url, json=payload)
+            except httpx.RequestError:
+                if attempt < 2:
+                    await asyncio.sleep(0.35 * (2**attempt))
+                    continue
+                return False
+            if response.status_code == 200:
+                return True
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 2:
+                    await asyncio.sleep(0.35 * (2**attempt))
+                    continue
+            return False
+        return False

@@ -29,7 +29,28 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://mahjourney:mahjourney@db:5432/mahjourney"
     persistence_enabled: bool = False
+    # Where orders/vehicles/drivers/depots come from. "synthetic" keeps the
+    # in-memory fixtures; "database" loads the imported operational data.
+    data_source: Literal["synthetic", "database"] = "database"
+    max_stops_per_vehicle: int = 25
+    # When false, delivery time windows are ignored during planning: every
+    # order can be served any time within the assigned vehicle's working
+    # hours (early or late), instead of being confined to its own
+    # window_start_minute/window_end_minute. Capacity, working-hours, and
+    # max-stops constraints are unaffected.
+    enforce_delivery_windows: bool = True
+    # When true (and a OneMap token is configured), stop visit order within each
+    # vehicle's route is optimized on real OneMap road distances instead of
+    # straight-line distance. Adds OneMap calls at plan-generation time, so it
+    # is best suited to small/demo fleets.
+    road_optimized_routing: bool = False
     app_session_secret: str = "development-only-session-secret"
+    # Single shared dispatcher/admin login. admin_password_hash is a
+    # "pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>" string produced by
+    # mahjourney.auth.hash_password — never store a plaintext password here.
+    admin_username: str = "admin"
+    admin_password_hash: str = ""
+    session_ttl_minutes: int = 720
     telegram_webhook_secret: str = "development-only-webhook-secret"
     enrollment_token_pepper: str = "development-only-enrollment-pepper"
     audit_chain_hmac_key: str = "development-only-audit-key"
@@ -84,7 +105,14 @@ class Settings(BaseSettings):
             raise ValueError("production requires generated application secrets")
         if not self.persistence_enabled:
             raise ValueError("production requires PostgreSQL persistence")
+        if not self.admin_password_hash:
+            raise ValueError("production requires ADMIN_PASSWORD_HASH to be set")
         return self
+
+    @property
+    def database_required(self) -> bool:
+        """A live DB connection is needed for persistence or DB-sourced data."""
+        return self.persistence_enabled or self.data_source == "database"
 
     @property
     def cors_origins(self) -> list[str]:

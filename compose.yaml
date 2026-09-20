@@ -22,6 +22,8 @@ services:
   api:
     build: ./backend
     env_file: .env
+    volumes:
+      - ./database/Singapore_Logistics_Delivery_Planning_Dataset.xlsx:/data/Singapore_Logistics_Delivery_Planning_Dataset.xlsx:ro
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mahjourney}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-mahjourney}
       PERSISTENCE_ENABLED: "true"

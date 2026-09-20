@@ -3,7 +3,7 @@ import pytest
 
 from mahjourney.config import Settings
 from mahjourney.domain import SnapshotStatus
-from mahjourney.integrations import LtaClient, OneMapClient
+from mahjourney.integrations import LtaClient, OneMapClient, TelegramClient
 
 
 @pytest.mark.asyncio
@@ -82,4 +82,46 @@ async def test_lta_speed_bands_uses_current_v4_endpoint() -> None:
     result = await adapter.collect("speed_bands")
     assert result.status == SnapshotStatus.FRESH
     assert requested_path.endswith("/v4/TrafficSpeedBands")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_message_without_token_is_a_noop() -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200)))
+    adapter = TelegramClient(Settings(telegram_bot_token=""), client)
+    assert await adapter.send_message(42, "hello") is False
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_message_posts_chat_id_and_text() -> None:
+    seen: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = request.content
+        return httpx.Response(200, json={"ok": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TelegramClient(Settings(telegram_bot_token="test-token"), client)
+    assert await adapter.send_message(42, "hello driver") is True
+    assert seen["path"] == "/bottest-token/sendMessage"
+    assert b'"chat_id":42' in seen["body"]
+    assert b'"hello driver"' in seen["body"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_telegram_send_message_retries_then_gives_up() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = TelegramClient(Settings(telegram_bot_token="test-token"), client)
+    assert await adapter.send_message(42, "hello") is False
+    assert calls == 3
     await client.aclose()

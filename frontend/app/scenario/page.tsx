@@ -4,7 +4,7 @@ import { CloudRain, FastForward, GitBranch, Pause, Play, RotateCcw, Siren, Truck
 import { useEffect, useState } from "react";
 import { AppShell } from "@/components/app-shell";
 import { DispatchMap } from "@/components/dispatch-map";
-import { api, fixtureMapState, type MapState } from "@/lib/api";
+import { api, depot, fixtureMapState, type MapState } from "@/lib/api";
 import { useWebMcpTool } from "@/hooks/use-webmcp";
 
 const injectDisruptionTool = {
@@ -26,7 +26,10 @@ export default function ScenarioPage() {
   useWebMcpTool(injectDisruptionTool, async (input) => {
     const eventType = (input as { event_type?: unknown }).event_type;
     if (typeof eventType !== "string" || !events.some((event) => event.type === eventType)) throw new Error("unsupported event_type");
-    const result = await api<{ event_id: string }>("/disruptions", { method: "POST", body: JSON.stringify({ scenario_id: "demo", event_type: eventType, effective_minute: minute, payload: { source: "webmcp" } }) });
+    const webMcpPayload: Record<string, unknown> = { source: "webmcp" };
+    if (eventType === "ROAD_CLOSURE") { webMcpPayload.lat = depot.lat; webMcpPayload.lon = depot.lon; webMcpPayload.radius_km = 1.5; }
+    if (eventType === "HEAVY_RAIN") webMcpPayload.severity = "HEAVY";
+    const result = await api<{ event_id: string }>("/disruptions", { method: "POST", body: JSON.stringify({ scenario_id: "demo", event_type: eventType, effective_minute: minute, payload: webMcpPayload }) });
     return { status: "injected", event_id: result.event_id, effective_minute: minute };
   });
   useEffect(() => { if (!playing) return; const timer = window.setInterval(() => setMinute((value) => Math.min(1080, value + speed)), 1000); return () => window.clearInterval(timer); }, [playing, speed]);
@@ -39,7 +42,15 @@ export default function ScenarioPage() {
       .then(setData)
       .catch(() => undefined);
   }, [minute, playing, speed]);
-  async function inject(type: string) { await api("/disruptions", { method: "POST", body: JSON.stringify({ scenario_id: "demo", event_type: type, effective_minute: minute, payload: { source: "dispatcher-demo" } }) }).catch(() => undefined); }
+  async function inject(type: string) {
+    // ROAD_CLOSURE needs a real location to affect planning: it defaults to
+    // the map's current center. HEAVY_RAIN is fleet-wide and needs none.
+    const payload: Record<string, unknown> = { source: "dispatcher-demo" };
+    if (type === "ROAD_CLOSURE") { payload.lat = depot.lat; payload.lon = depot.lon; payload.radius_km = 1.5; }
+    if (type === "HEAVY_RAIN") payload.severity = "HEAVY";
+    await api("/disruptions", { method: "POST", body: JSON.stringify({ scenario_id: "demo", event_type: type, effective_minute: minute, payload }) }).catch(() => undefined);
+    await api<MapState>("/map/state?scenario_id=demo").then(setData).catch(() => undefined);
+  }
   async function resetScenario() {
     await api("/scenario/demo/reset", { method: "POST" }).catch(() => undefined);
     setMinute(480);

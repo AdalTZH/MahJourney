@@ -126,6 +126,46 @@ Only `ONEMAP_ACCESS_TOKEN` is used for OneMap. The application never requests or
 
 Safe defaults keep `TELEGRAM_SEND_TESTS=false`, `ALLOW_PLAN_EXECUTION_IN_TESTS=false`, `BERT_GUARD_ENABLED=false`, and `MASCOT_ENABLED=false`.
 
+## Admin access
+
+Every route except `/health`, `/ready`, `/telegram/webhook`, and `/auth/*` requires a signed-in admin session. This exists so a public deployment can't have its OpenAI/OneMap/LTA/NEA/Telegram credentials spent by an anonymous visitor, and so plan activation and driver messaging stay dispatcher-only.
+
+There is a single shared admin credential (no per-user accounts). Set it via two environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `ADMIN_USERNAME` | Login username. Defaults to `admin`. |
+| `ADMIN_PASSWORD_HASH` | A salted PBKDF2 hash of the admin password. Never put a plaintext password here. |
+| `SESSION_TTL_MINUTES` | How long a login stays valid before requiring sign-in again. Defaults to 720 (12 hours). |
+
+Generate a password hash (run once, then paste the output into `.env`):
+
+```powershell
+docker compose exec api python -c "from mahjourney.auth import hash_password; print(hash_password('your-password'))"
+```
+
+The hash contains `$` characters. Because Docker Compose treats `.env` as subject to variable interpolation, every `$` in the value must be escaped as `$$` when pasted into `.env`, or Compose will silently blank the value out:
+
+```dotenv
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD_HASH=pbkdf2_sha256$$260000$$<salt>$$<hash>
+SESSION_TTL_MINUTES=720
+```
+
+Rebuild and restart the `api` service after changing either value:
+
+```powershell
+docker compose up -d --build api
+```
+
+Sign in at `http://localhost/login` (or your public domain once deployed). A session is a signed, `HttpOnly` cookie — it cannot be read or forged from JavaScript, and `main.py` verifies its signature and expiry on every protected request via the `require_admin` dependency. Logging in from repeated failed attempts from the same source IP is throttled (locked out for 60 seconds after 5 failures) to slow down credential stuffing against the login endpoint itself.
+
+In production (`APP_ENV=production`), the app refuses to start if `ADMIN_PASSWORD_HASH` is unset — the same validator that already requires generated (non-default) secrets and PostgreSQL persistence.
+
+`/docs`, `/redoc`, and `/openapi.json` (FastAPI's auto-generated API documentation) are also behind the same login — they are re-registered explicitly with `require_admin` rather than left on FastAPI's defaults, since the schema they expose is a complete map of every endpoint and parameter.
+
+The `/ws/events` WebSocket stream (map heartbeat/events) is not currently gated by the session cookie — it only carries non-sensitive, non-costing operational status, so this was judged an acceptable gap rather than scope-expanding into WebSocket-specific auth. Everything that costs money (OpenAI, OneMap, LTA, NEA) or mutates dispatcher state (plan activation, Telegram dispatch, approvals, memory curation) is behind the login.
+
 ## Live-data schedules
 
 | Source | Dataset | Poll interval | Stale after |
@@ -176,7 +216,7 @@ It runs fixture tests before optional read-only LTA, NEA, and OneMap checks. It 
 
 Current local verification:
 
-- 32 backend tests passing.
+- 56 backend tests passing.
 - 100% hard-constraint compliance across 24 evaluation scenarios.
 - 100% autonomy-policy compliance and zero infeasible automatic executions.
 - 31.1% median cost improvement over the greedy baseline.
@@ -187,17 +227,22 @@ Evaluation figures are fixture-based hackathon evidence, not production performa
 
 ## Application and API entry points
 
+All entry points below require an admin session (see [Admin access](#admin-access)) except `/login`, `/health`, `/ready`, and `/telegram/webhook`.
+
 | Entry point | Purpose |
 |---|---|
+| `/login` | Admin sign-in page |
 | `/dispatcher` | Live fleet map, plan summary, alerts, assignments, approvals, and dispatcher console |
 | `/scenario` | Virtual clock, playback speeds, seeking, reset, branching, and disruption injection |
 | `/operations` | Data freshness, agent/policy trace, forecast gate, evaluations, and audit verification |
+| `/api/v1/auth/login` | Verify credentials and start a session |
 | `/api/v1/map/state` | Current plan and simulated truck positions |
 | `/api/v1/plans/generate` | Generate and road-enrich a candidate plan |
+| `/api/v1/plans/activate` | Activate a plan and dispatch it to enrolled drivers over Telegram |
 | `/api/v1/dispatcher/messages` | Submit dispatcher requests to the bounded agent graph |
 | `/api/v1/operations/integrations` | Integration health and freshness |
 | `/api/v1/evaluations/run` | Run the 24-case evaluation harness |
-| `/ws/events` | Live application events |
+| `/ws/events` | Live application events (not session-gated — see [Admin access](#admin-access)) |
 
 The complete REST contract is available from the generated FastAPI documentation.
 

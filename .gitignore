@@ -3,10 +3,12 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
 .coverage
 artifacts/
 .playwright-cli/
 output/
+gen_out.json
 frontend/node_modules/
 frontend/.vinext/
 frontend/dist/

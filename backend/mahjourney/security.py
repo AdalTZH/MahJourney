@@ -21,14 +21,21 @@ class EnrollmentService:
         self._bindings: dict[int, str] = {}
         self._suspended: set[str] = set()
 
-    def issue(self, driver_id: str, ttl_minutes: int = 10) -> str:
+    def issue(self, driver_id: str, ttl_minutes: int = 10) -> tuple[str, str, datetime]:
+        """Issue a fresh enrollment token for a driver.
+
+        Returns the raw token (sent to the driver, never stored) alongside its
+        digest and expiry so a caller can persist the pending enrollment.
+        """
         token = secrets.token_urlsafe(32)
-        self._pending[secure_digest(token, self.pepper)] = {
+        digest = secure_digest(token, self.pepper)
+        expires_at = datetime.now(UTC) + timedelta(minutes=ttl_minutes)
+        self._pending[digest] = {
             "driver_id": driver_id,
-            "expires_at": datetime.now(UTC) + timedelta(minutes=ttl_minutes),
+            "expires_at": expires_at,
             "used": False,
         }
-        return token
+        return token, digest, expires_at
 
     def enroll(self, token: str, telegram_user_id: int, chat_type: str) -> str:
         if chat_type != "private":
@@ -44,8 +51,42 @@ class EnrollmentService:
         driver_id = self._bindings.get(telegram_user_id)
         return None if driver_id in self._suspended else driver_id
 
+    def telegram_user_for(self, driver_id: str) -> int | None:
+        """Reverse lookup: the Telegram user id bound to a driver, if any."""
+        if driver_id in self._suspended:
+            return None
+        for telegram_user_id, bound_driver_id in self._bindings.items():
+            if bound_driver_id == driver_id:
+                return telegram_user_id
+        return None
+
     def suspend(self, driver_id: str) -> None:
         self._suspended.add(driver_id)
+
+    def restore(self, records: tuple[dict[str, Any], ...]) -> None:
+        """Rehydrate pending enrollments, bound drivers, and suspensions.
+
+        Called once at startup with rows loaded from ``telegram_drivers`` so
+        driver-to-Telegram bindings survive an API restart. Each record is a
+        mapping with ``driver_id``, ``telegram_user_id``, ``enrollment_digest``,
+        ``enrollment_expires_at``, ``enrollment_used_at``, and ``suspended_at``.
+        """
+        for record in records:
+            driver_id = record["driver_id"]
+            digest = record.get("enrollment_digest")
+            if digest and not record.get("enrollment_used_at"):
+                expires_at = record.get("enrollment_expires_at")
+                if expires_at is not None:
+                    self._pending[digest] = {
+                        "driver_id": driver_id,
+                        "expires_at": expires_at,
+                        "used": False,
+                    }
+            telegram_user_id = record.get("telegram_user_id")
+            if telegram_user_id is not None:
+                self._bindings[int(telegram_user_id)] = driver_id
+            if record.get("suspended_at"):
+                self._suspended.add(driver_id)
 
 
 class ApprovalService:
