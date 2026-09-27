@@ -1,6 +1,7 @@
 .env
 .env.generated-secrets
 .venv/
+.venv-win/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -8,9 +9,16 @@ __pycache__/
 artifacts/
 .playwright-cli/
 output/
+tmp/
+.kiro/
 gen_out.json
-frontend/node_modules/
+node_modules/
+frontend/.next/
 frontend/.vinext/
 frontend/dist/
 frontend/.wrangler/
+frontend/tsconfig.tsbuildinfo
+backend/test_run_output.log
+backend/$null
+*.log
 *.pyc
