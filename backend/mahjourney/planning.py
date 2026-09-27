@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
+from dataclasses import dataclass, field
 from uuid import uuid4
 
+from .disruptions import path_intersects_polygon
 from .domain import (
     Coordinate,
     Depot,
@@ -15,11 +18,56 @@ from .domain import (
     VehicleRoute,
 )
 
+logger = logging.getLogger(__name__)
+
+# Leg-level closure avoidance (R10). A leg whose straight source->target segment
+# crosses an active closure zone is penalized so the solver sequences around it.
+# HARD: a prohibitive per-leg cost (well above any achievable real route cost,
+# same order of magnitude as the drop penalty) so the solver only uses a crossing
+# leg if it literally has no closure-free alternative. SOFT: a large multiplier
+# used on a fallback re-solve when EVERY ordering must cross, so a candidate is
+# still produced rather than failing. Distances/times are in km/minutes at city
+# scale, so these constants dwarf any real leg.
+CLOSURE_HARD_LEG_PENALTY = 1_000_000
+CLOSURE_SOFT_LEG_MULTIPLIER = 1000
+
 # Realistic capacity dimensions are scaled to integers because OR-Tools capacity
 # dimensions operate on integers. Grams and litres keep enough precision.
 _WEIGHT_SCALE = 1000  # kg -> grams
 _VOLUME_SCALE = 1000  # m3 -> litres
 DEFAULT_MAX_STOPS_PER_VEHICLE = 25
+# Default OR-Tools search budget (seconds) when a caller does not pass one.
+# Kept in the 2-10s range recommended for real depot sizes; the previous
+# hardcoded 250ms rarely let the metaheuristic improve on the first solution.
+DEFAULT_ORTOOLS_TIME_LIMIT_SECONDS = 5
+
+
+@dataclass
+class SolverStats:
+    """Per-plan accounting of how each vehicle's route was solved.
+
+    ``build_plan`` passes one instance down through ``_ortools_order`` so that,
+    after a plan is built, we can log which solver path actually produced each
+    route. ``ortools`` counts routes solved by OR-Tools, ``fallback`` counts
+    routes that dropped to the deterministic nearest-neighbor path, and
+    ``fallback_reasons`` records the distinct exception/None causes so a silent
+    degradation to greedy construction is visible instead of hidden.
+    """
+
+    ortools: int = 0
+    fallback: int = 0
+    fallback_reasons: list[str] = field(default_factory=list)
+
+    def record_ortools(self) -> None:
+        self.ortools += 1
+
+    def record_fallback(self, reason: str) -> None:
+        self.fallback += 1
+        self.fallback_reasons.append(reason)
+
+    @property
+    def total(self) -> int:
+        return self.ortools + self.fallback
 
 
 def order_service_seconds(order: Order) -> int:
@@ -97,6 +145,24 @@ def leg_travel_minutes(
     return max(1, math.ceil(km / speed_kph * 60))
 
 
+def leg_crosses_closure(
+    a: Coordinate,
+    b: Coordinate,
+    closure_polygons: tuple[tuple[Coordinate, ...], ...] | None,
+) -> bool:
+    """Whether the straight leg ``a -> b`` enters or crosses any closure zone.
+
+    Reuses the same geometry predicate the disruption engine uses to decide
+    whether a route path is affected, applied to a single leg's straight
+    segment. Returns ``False`` when there are no closure polygons, so the
+    default (no-closure) planning path pays nothing.
+    """
+    if not closure_polygons:
+        return False
+    segment = (a, b)
+    return any(path_intersects_polygon(segment, polygon) for polygon in closure_polygons)
+
+
 def _fits(vehicle: Vehicle, load: list[Order], candidate: Order, max_stops: int) -> bool:
     """Whether adding ``candidate`` keeps the load within every hard capacity."""
     if len(load) + 1 > max_stops:
@@ -112,19 +178,31 @@ def _nearest_neighbor(
     max_stops: int = DEFAULT_MAX_STOPS_PER_VEHICLE,
     road_distance_km: dict[tuple[str, str], float] | None = None,
     enforce_delivery_windows: bool = True,
+    *,
+    start_coordinate: Coordinate | None = None,
+    start_node_id: str | None = None,
+    start_minute: int | None = None,
+    closure_polygons: tuple[tuple[Coordinate, ...], ...] | None = None,
 ) -> list[Order]:
     remaining = list(orders)
-    current = vehicle.start
-    current_id = depot_node_id(vehicle.start)
-    start_minute = vehicle.working_start_minute
+    # Origin defaults to the depot at shift start; a mid-route reroute overrides
+    # it to the vehicle's current position and time (see _ortools_order).
+    current = start_coordinate if start_coordinate is not None else vehicle.start
+    current_id = start_node_id if start_node_id is not None else depot_node_id(vehicle.start)
+    start_minute = start_minute if start_minute is not None else vehicle.working_start_minute
     route: list[Order] = []
     while remaining:
         feasible = [order for order in remaining if _fits(vehicle, route, order, max_stops)]
         if not feasible:
             break
+        # Leg-level closure avoidance (R10): a leg into ``order`` that crosses a
+        # closure sorts after every non-crossing option (the leading 0/1 key), so
+        # a crossing leg is only chosen when no closure-free feasible order
+        # remains — mirroring the OR-Tools hard-exclusion-then-soft behavior.
         chosen = min(
             feasible,
             key=lambda order: (
+                1 if leg_crosses_closure(current, order.location, closure_polygons) else 0,
                 max(
                     0,
                     start_minute
@@ -156,6 +234,13 @@ def _ortools_order(
     allow_drops: bool = False,
     road_distance_km: dict[tuple[str, str], float] | None = None,
     enforce_delivery_windows: bool = True,
+    time_limit_seconds: float = DEFAULT_ORTOOLS_TIME_LIMIT_SECONDS,
+    stats: SolverStats | None = None,
+    *,
+    start_coordinate: Coordinate | None = None,
+    start_node_id: str | None = None,
+    start_minute: int | None = None,
+    closure_polygons: tuple[tuple[Coordinate, ...], ...] | None = None,
 ) -> list[Order]:
     """Solve one route under weight/volume/time/working-hours/max-stops constraints.
 
@@ -166,115 +251,239 @@ def _ortools_order(
     unavailable or fails to converge. When ``enforce_delivery_windows`` is
     false, every order's effective window is the vehicle's own working
     window, so orders can be served any time the vehicle/driver is available.
+
+    OR-Tools searches with GUIDED_LOCAL_SEARCH for up to ``time_limit_seconds``,
+    so it can improve on the greedy first solution instead of returning it as-is.
+    Whenever the search falls back to nearest-neighbor — OR-Tools missing, an
+    error, or no solution found within the budget — that is recorded on
+    ``stats`` (if given) and logged at WARNING level so the degradation to
+    greedy construction is never silent.
+
+    ``start_coordinate`` / ``start_node_id`` / ``start_minute`` override the
+    route's origin and departure time. When omitted (the default) the origin is
+    the depot at the vehicle's shift start — exactly today's behavior for every
+    existing caller. A mid-route reroute passes the vehicle's current position
+    and current time so node 0 is seeded there instead of the depot; the route
+    still terminates at the depot. The fallback carries the same override.
+
+    ``closure_polygons`` (R10) makes the solver sequence AROUND a road closure:
+    any leg whose straight source->target segment crosses a closure zone is
+    penalized. A two-pass scheme first HARD-excludes crossing legs (prohibitive
+    cost), then, only if that leaves no solution (every ordering must cross),
+    re-solves with a large SOFT multiplier so a candidate is still produced. With
+    no closures, cost is exactly today's. This shapes the visit ORDER only; it
+    does not bend an individual leg's road geometry (that needs an avoid-area
+    provider and is out of scope).
     """
     if not orders:
         return []
-    start_minute = vehicle.working_start_minute
-    end_minute = max(vehicle.working_start_minute + 1, vehicle.working_end_minute)
+
+    # Origin overrides default to the depot at shift start (today's behavior).
+    origin_coordinate = start_coordinate if start_coordinate is not None else vehicle.start
+    origin_node_id = start_node_id if start_node_id is not None else depot_node_id(vehicle.start)
+    start_minute = start_minute if start_minute is not None else vehicle.working_start_minute
+
+    def _fallback(reason: str) -> list[Order]:
+        logger.warning(
+            "route solver fell back to nearest-neighbor: vehicle=%s stops=%d reason=%s",
+            vehicle.vehicle_id,
+            len(orders),
+            reason,
+        )
+        if stats is not None:
+            stats.record_fallback(reason)
+        return _nearest_neighbor(
+            vehicle,
+            orders,
+            max_stops,
+            road_distance_km,
+            enforce_delivery_windows,
+            start_coordinate=start_coordinate,
+            start_node_id=start_node_id,
+            start_minute=start_minute,
+            closure_polygons=closure_polygons,
+        )
+
+    end_minute = max(start_minute + 1, vehicle.working_end_minute)
     horizon = max(1, end_minute - start_minute)
-    node_ids = [depot_node_id(vehicle.start), *(order.order_id for order in orders)]
+    # Node 0 is the route origin (depot by default, or the mid-route start).
+    node_ids = [origin_node_id, *(order.order_id for order in orders)]
+    # When the origin is NOT the depot (a mid-route reroute), the route must
+    # still finish at the depot rather than back at the mid-route start, so we
+    # append a distinct depot end-node and give the solver an explicit end. In
+    # the default (depot origin) case, start == end == node 0, which is exactly
+    # today's single-node-0 behavior.
+    reroute_origin = start_coordinate is not None
+    if reroute_origin:
+        depot_end_node = len(orders) + 1
+        node_ids.append(depot_node_id(vehicle.start))
+        end_coordinate = vehicle.start
+    else:
+        depot_end_node = 0
+        end_coordinate = origin_coordinate
     try:
         from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-        locations = [vehicle.start, *(order.location for order in orders)]
-        manager = pywrapcp.RoutingIndexManager(len(locations), 1, 0)
-        routing = pywrapcp.RoutingModel(manager)
+        locations = [origin_coordinate, *(order.location for order in orders)]
 
-        def transit(from_index: int, to_index: int) -> int:
-            source_node = manager.IndexToNode(from_index)
-            target_node = manager.IndexToNode(to_index)
-            source = locations[source_node]
-            target = locations[target_node]
-            speed = (
-                speed_kph_by_stop.get(orders[target_node - 1].order_id, 28.0)
-                if speed_kph_by_stop and target_node
-                else 28.0
-            )
-            service = (
-                math.ceil(order_service_seconds(orders[target_node - 1]) / 60)
-                if target_node
-                else 0
-            )
-            travel = leg_travel_minutes(
-                node_ids[source_node], node_ids[target_node], source, target, speed,
-                road_distance_km,
-            )
-            return travel + service
+        def _is_order_node(node: int) -> bool:
+            # Node 0 is the origin; the appended depot_end_node (reroute case) is
+            # the terminus. Both carry no order demand/service.
+            return node != 0 and node != depot_end_node
 
-        transit_index = routing.RegisterTransitCallback(transit)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_index)
-        # Time dimension spans the whole shift; the depot start is pinned to the
-        # working-hours start and every served node must respect its window.
-        routing.AddDimension(transit_index, horizon, end_minute, False, "Time")
-        time_dimension = routing.GetDimensionOrDie("Time")
-        time_dimension.CumulVar(routing.Start(0)).SetRange(start_minute, start_minute)
-        # A drop penalty larger than any achievable route cost guarantees that
-        # OR-Tools only sheds an order when it is genuinely infeasible.
-        drop_penalty = end_minute * len(orders) + 1_000_000
-        for node, order in enumerate(orders, start=1):
-            index = manager.NodeToIndex(node)
-            order_window_start, order_window_end = effective_window(
-                order, vehicle, enforce_delivery_windows=enforce_delivery_windows
-            )
-            window_start = max(order_window_start, start_minute)
-            window_end = min(order_window_end, end_minute)
-            if window_start > window_end:
-                # Cannot be served inside this vehicle's shift.
+        def _solve_with_leg_penalty(leg_penalty: int):
+            """Build and solve the model once; ``leg_penalty`` is added to the
+            cost of any leg crossing a closure zone (R10). Returns the ordered
+            order list, or ``None`` if OR-Tools found no solution in the budget.
+
+            Called twice by the two-pass scheme: first with a prohibitive HARD
+            penalty (so the solver avoids closure legs entirely when it can),
+            then, only if that yields no solution, with a large SOFT multiplier
+            so a candidate is still produced when every ordering must cross.
+            ``leg_penalty == 0`` (no closures) is exactly today's cost model.
+            """
+            solve_locations = list(locations)
+            if reroute_origin:
+                solve_locations.append(end_coordinate)
+                manager = pywrapcp.RoutingIndexManager(
+                    len(solve_locations), 1, [0], [depot_end_node]
+                )
+            else:
+                manager = pywrapcp.RoutingIndexManager(len(solve_locations), 1, 0)
+            routing = pywrapcp.RoutingModel(manager)
+
+            def transit(from_index: int, to_index: int) -> int:
+                source_node = manager.IndexToNode(from_index)
+                target_node = manager.IndexToNode(to_index)
+                source = solve_locations[source_node]
+                target = solve_locations[target_node]
+                speed = (
+                    speed_kph_by_stop.get(orders[target_node - 1].order_id, 28.0)
+                    if speed_kph_by_stop and _is_order_node(target_node)
+                    else 28.0
+                )
+                service = (
+                    math.ceil(order_service_seconds(orders[target_node - 1]) / 60)
+                    if _is_order_node(target_node)
+                    else 0
+                )
+                travel = leg_travel_minutes(
+                    node_ids[source_node], node_ids[target_node], source, target, speed,
+                    road_distance_km,
+                )
+                penalty = (
+                    leg_penalty
+                    if leg_penalty and leg_crosses_closure(source, target, closure_polygons)
+                    else 0
+                )
+                return travel + service + penalty
+
+            transit_index = routing.RegisterTransitCallback(transit)
+            routing.SetArcCostEvaluatorOfAllVehicles(transit_index)
+            # Time dimension spans the whole shift; the depot start is pinned to
+            # the working-hours start and every served node must respect its window.
+            routing.AddDimension(transit_index, horizon, end_minute, False, "Time")
+            time_dimension = routing.GetDimensionOrDie("Time")
+            time_dimension.CumulVar(routing.Start(0)).SetRange(start_minute, start_minute)
+            # A drop penalty larger than any achievable route cost guarantees that
+            # OR-Tools only sheds an order when it is genuinely infeasible.
+            drop_penalty = end_minute * len(orders) + 1_000_000
+            for node, order in enumerate(orders, start=1):
+                index = manager.NodeToIndex(node)
+                order_window_start, order_window_end = effective_window(
+                    order, vehicle, enforce_delivery_windows=enforce_delivery_windows
+                )
+                window_start = max(order_window_start, start_minute)
+                window_end = min(order_window_end, end_minute)
+                if window_start > window_end:
+                    # Cannot be served inside this vehicle's shift.
+                    if allow_drops:
+                        # Force-drop: make the node mandatory-to-skip by giving it
+                        # an empty feasible window plus a disjunction so the solver
+                        # excludes it instead of serving it past working hours.
+                        routing.AddDisjunction([index], 0)
+                        continue
+                    # Legacy single-origin path: keep the order's own window so the
+                    # historical fixture behavior (no drops) is preserved.
+                    window_start, window_end = order_window_start, order_window_end
+                time_dimension.CumulVar(index).SetRange(window_start, window_end)
                 if allow_drops:
-                    # Force-drop: make the node mandatory-to-skip by giving it an
-                    # empty feasible window plus a disjunction so the solver
-                    # excludes it instead of serving it past working hours.
-                    routing.AddDisjunction([index], 0)
-                    continue
-                # Legacy single-origin path: keep the order's own window so the
-                # historical fixture behavior (no drops) is preserved.
-                window_start, window_end = order_window_start, order_window_end
-            time_dimension.CumulVar(index).SetRange(window_start, window_end)
-            if allow_drops:
-                routing.AddDisjunction([index], drop_penalty)
+                    routing.AddDisjunction([index], drop_penalty)
 
-        def weight_demand(from_index: int) -> int:
-            node = manager.IndexToNode(from_index)
-            return 0 if node == 0 else round(orders[node - 1].weight_kg * _WEIGHT_SCALE)
+            def weight_demand(from_index: int) -> int:
+                node = manager.IndexToNode(from_index)
+                return (
+                    round(orders[node - 1].weight_kg * _WEIGHT_SCALE)
+                    if _is_order_node(node) else 0
+                )
 
-        def volume_demand(from_index: int) -> int:
-            node = manager.IndexToNode(from_index)
-            return 0 if node == 0 else round(orders[node - 1].volume_m3 * _VOLUME_SCALE)
+            def volume_demand(from_index: int) -> int:
+                node = manager.IndexToNode(from_index)
+                return (
+                    round(orders[node - 1].volume_m3 * _VOLUME_SCALE)
+                    if _is_order_node(node) else 0
+                )
 
-        def stop_demand(from_index: int) -> int:
-            return 0 if manager.IndexToNode(from_index) == 0 else 1
+            def stop_demand(from_index: int) -> int:
+                return 1 if _is_order_node(manager.IndexToNode(from_index)) else 0
 
-        weight_index = routing.RegisterUnaryTransitCallback(weight_demand)
-        routing.AddDimensionWithVehicleCapacity(
-            weight_index, 0, [round(vehicle.capacity_weight_kg * _WEIGHT_SCALE)], True, "Weight"
-        )
-        volume_index = routing.RegisterUnaryTransitCallback(volume_demand)
-        routing.AddDimensionWithVehicleCapacity(
-            volume_index, 0, [round(vehicle.capacity_volume_m3 * _VOLUME_SCALE)], True, "Volume"
-        )
-        stop_index = routing.RegisterUnaryTransitCallback(stop_demand)
-        routing.AddDimensionWithVehicleCapacity(stop_index, 0, [max_stops], True, "Stops")
-
-        search = pywrapcp.DefaultRoutingSearchParameters()
-        search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        search.time_limit.FromMilliseconds(250)
-        solution = routing.SolveWithParameters(search)
-        if solution is None:
-            return _nearest_neighbor(
-                vehicle, orders, max_stops, road_distance_km, enforce_delivery_windows
+            weight_index = routing.RegisterUnaryTransitCallback(weight_demand)
+            routing.AddDimensionWithVehicleCapacity(
+                weight_index, 0, [round(vehicle.capacity_weight_kg * _WEIGHT_SCALE)], True, "Weight"
             )
-        ordered: list[Order] = []
-        index = routing.Start(0)
-        while not routing.IsEnd(index):
-            node = manager.IndexToNode(index)
-            if node:
-                ordered.append(orders[node - 1])
-            index = solution.Value(routing.NextVar(index))
-        return ordered
-    except (ImportError, RuntimeError, ValueError):
-        return _nearest_neighbor(
-            vehicle, orders, max_stops, road_distance_km, enforce_delivery_windows
-        )
+            volume_index = routing.RegisterUnaryTransitCallback(volume_demand)
+            routing.AddDimensionWithVehicleCapacity(
+                volume_index, 0, [round(vehicle.capacity_volume_m3 * _VOLUME_SCALE)], True, "Volume"
+            )
+            stop_index = routing.RegisterUnaryTransitCallback(stop_demand)
+            routing.AddDimensionWithVehicleCapacity(stop_index, 0, [max_stops], True, "Stops")
+
+            search = pywrapcp.DefaultRoutingSearchParameters()
+            search.first_solution_strategy = (
+                routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+            )
+            # Guided local search escapes the local minimum the cheapest-arc first
+            # solution lands in, so the extra time budget actually buys shorter
+            # routes rather than re-confirming the greedy construction.
+            search.local_search_metaheuristic = (
+                routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+            )
+            # GLS never terminates on its own, so a wall-clock budget bounds the
+            # search. Clamp to at least 1ms so a misconfigured 0 still runs.
+            search.time_limit.FromMilliseconds(max(1, round(time_limit_seconds * 1000)))
+            solution = routing.SolveWithParameters(search)
+            if solution is None:
+                return None
+            ordered: list[Order] = []
+            index = routing.Start(0)
+            while not routing.IsEnd(index):
+                node = manager.IndexToNode(index)
+                if _is_order_node(node):
+                    ordered.append(orders[node - 1])
+                index = solution.Value(routing.NextVar(index))
+            return ordered
+
+        # Two-pass leg-level closure avoidance (R10). First pass hard-excludes any
+        # leg crossing a closure so the solver sequences around it. If that yields
+        # no solution (every ordering must cross the closure), retry with a large
+        # SOFT multiplier so a candidate is still produced rather than failing.
+        # With no closures, the first pass uses leg_penalty 0 — today's cost model.
+        first_penalty = CLOSURE_HARD_LEG_PENALTY if closure_polygons else 0
+        result = _solve_with_leg_penalty(first_penalty)
+        if result is None and closure_polygons:
+            logger.info(
+                "closure hard-exclusion left no solution for vehicle=%s; "
+                "retrying with soft leg penalty",
+                vehicle.vehicle_id,
+            )
+            result = _solve_with_leg_penalty(CLOSURE_SOFT_LEG_MULTIPLIER)
+        if result is None:
+            return _fallback("no_solution_within_time_limit")
+        if stats is not None:
+            stats.record_ortools()
+        return result
+    except (ImportError, RuntimeError, ValueError) as exc:
+        return _fallback(f"{type(exc).__name__}: {exc}")
 
 
 def _build_route(
@@ -283,17 +492,36 @@ def _build_route(
     speed_kph_by_stop: dict[str, float] | None = None,
     road_distance_km: dict[tuple[str, str], float] | None = None,
     enforce_delivery_windows: bool = True,
+    *,
+    start_coordinate: Coordinate | None = None,
+    start_node_id: str | None = None,
+    start_minute: int | None = None,
+    closure_polygons: tuple[tuple[Coordinate, ...], ...] | None = None,
 ) -> VehicleRoute:
-    minute = vehicle.working_start_minute
-    current = vehicle.start
-    current_id = depot_node_id(vehicle.start)
+    # Origin defaults to the depot at shift start (today's behavior). A mid-route
+    # reroute overrides these to the vehicle's current position and time, so the
+    # rebuilt tail's ETAs are computed from "now", not from the shift start. The
+    # route still returns to the depot (vehicle.start) at the end.
+    #
+    # ``closure_polygons`` (R10) does NOT alter the physical distance/time this
+    # function reports — those must stay real km/minutes. It is used only to
+    # surface whether the chosen sequence still traverses a closure (logged), so
+    # this stays consistent with the solver, which already sequenced to avoid
+    # crossings. The solver's cost penalty shapes the ORDER; _build_route reports
+    # the true cost of that order.
+    minute = start_minute if start_minute is not None else vehicle.working_start_minute
+    current = start_coordinate if start_coordinate is not None else vehicle.start
+    current_id = start_node_id if start_node_id is not None else depot_node_id(vehicle.start)
+    crossed_closure = False
     distance = 0.0
-    # Moment the vehicle actually rolls out of the depot toward its first stop.
-    # A vehicle whose first delivery window opens later waits at the depot rather
-    # than departing early, so leading idle time is excluded from duration.
+    # Moment the vehicle actually rolls out toward its first stop. A vehicle whose
+    # first delivery window opens later waits rather than departing early, so
+    # leading idle time is excluded from duration.
     depart_depot_minute: int | None = None
     stops: list[RouteStop] = []
     for sequence, order in enumerate(orders, start=1):
+        if leg_crosses_closure(current, order.location, closure_polygons):
+            crossed_closure = True
         distance += leg_distance_km(
             current_id, order.order_id, current, order.location, road_distance_km
         )
@@ -326,10 +554,21 @@ def _build_route(
         current = order.location
         current_id = order.order_id
     return_id = depot_node_id(vehicle.start)
+    if leg_crosses_closure(current, vehicle.start, closure_polygons):
+        crossed_closure = True
     distance += leg_distance_km(current_id, return_id, current, vehicle.start, road_distance_km)
     minute += leg_travel_minutes(
         current_id, return_id, current, vehicle.start, 28.0, road_distance_km
     )
+    if crossed_closure:
+        # The chosen sequence still traverses a closure zone. This is expected
+        # only when avoidance was impossible (soft-fallback in _ortools_order);
+        # surfaced here so a route that unavoidably drives through a closure is
+        # visible rather than silent.
+        logger.info(
+            "built route for vehicle=%s traverses a closure zone (avoidance not possible)",
+            vehicle.vehicle_id,
+        )
     # Active route time: from rolling out of the depot to returning, excluding
     # the idle wait before the first delivery window opens. Empty routes are 0.
     start_reference = depart_depot_minute if depart_depot_minute is not None else minute
@@ -371,14 +610,17 @@ def reapply_route_timing(
         sequence_orders = [
             order_by_id[stop.stop_id] for stop in route.stops if stop.stop_id in order_by_id
         ]
-        routes.append(
-            _build_route(
-                vehicle,
-                sequence_orders,
-                speed_kph_by_stop,
-                enforce_delivery_windows=enforce_delivery_windows,
-            )
+        rebuilt = _build_route(
+            vehicle,
+            sequence_orders,
+            speed_kph_by_stop,
+            enforce_delivery_windows=enforce_delivery_windows,
         )
+        # Re-timing keeps the same stops and sequence, so the road geometry is
+        # still valid — carry it over. _build_route doesn't set geometry (that's
+        # OneMap enrichment), so without this every route line would lose its
+        # geometry and disappear from the map after a live disruption re-time.
+        routes.append(rebuilt.model_copy(update={"geometry": route.geometry}))
     updated = plan.model_copy(
         update={
             "routes": tuple(routes),
@@ -587,7 +829,38 @@ def build_plan(
     max_stops_per_vehicle: int = DEFAULT_MAX_STOPS_PER_VEHICLE,
     road_distance_km: dict[tuple[str, str], float] | None = None,
     enforce_delivery_windows: bool = True,
+    ortools_time_limit_seconds: float | None = None,
 ) -> PlanVersion:
+    # When the caller doesn't pin a budget, resolve it from settings so a single
+    # env var (ORTOOLS_TIME_LIMIT_SECONDS) governs every plan build — including
+    # the many direct build_plan() calls in tests, which is what lets the test
+    # env drop the budget to keep CI fast. Falls back to the module default if
+    # settings can't be loaded (keeps planning importable in isolation).
+    if ortools_time_limit_seconds is None:
+        try:
+            from .config import get_settings
+
+            ortools_time_limit_seconds = float(get_settings().ortools_time_limit_seconds)
+        except Exception:
+            ortools_time_limit_seconds = DEFAULT_ORTOOLS_TIME_LIMIT_SECONDS
+    # Accumulates which solver path produced each route so the quality summary
+    # below can report OR-Tools vs. nearest-neighbor usage for this plan.
+    stats = SolverStats()
+
+    def _per_solve_limit(buckets: dict[str, list[Order]]) -> float:
+        """Split the plan-wide OR-Tools budget across the routes being solved.
+
+        GUIDED_LOCAL_SEARCH runs until its wall-clock limit expires — it never
+        stops early — so a per-vehicle limit would make total plan latency scale
+        with fleet size. Treating ``ortools_time_limit_seconds`` as a budget for
+        the whole plan and dividing it across the vehicles that actually have
+        stops keeps end-to-end plan time roughly constant regardless of fleet
+        size. A 0.25s floor keeps each solve meaningful for large fleets.
+        """
+        solves = sum(1 for stops in buckets.values() if stops)
+        if solves <= 1:
+            return ortools_time_limit_seconds
+        return max(0.25, ortools_time_limit_seconds / solves)
     # When depots are supplied, plan per depot: each order is served by a
     # vehicle based at its assigned depot. Without depots we fall back to the
     # original single-origin sweep so synthetic fixtures keep working.
@@ -600,13 +873,24 @@ def build_plan(
         for order in assigned_orders:
             orders_by_depot[order.assigned_depot_id].append(order)
         depot_origin = {depot.depot_id: depot.location for depot in depots}
-        routes: list[VehicleRoute] = []
+        # Build every depot's buckets first so the OR-Tools budget can be split
+        # across all routes in the whole plan, not reset per depot.
+        buckets_by_depot: dict[str, dict[str, list[Order]]] = {}
         for depot_id, depot_vehicles in vehicles_by_depot.items():
             depot_orders = orders_by_depot.get(depot_id, [])
             origin = depot_origin.get(depot_id, depot_vehicles[0].start)
-            buckets = _time_aware_buckets(
+            buckets_by_depot[depot_id] = _time_aware_buckets(
                 tuple(depot_vehicles), depot_orders, origin, enforce_delivery_windows
             )
+        all_buckets: dict[str, list[Order]] = {
+            vid: stops
+            for depot_buckets in buckets_by_depot.values()
+            for vid, stops in depot_buckets.items()
+        }
+        per_solve = _per_solve_limit(all_buckets)
+        routes: list[VehicleRoute] = []
+        for depot_id, depot_vehicles in vehicles_by_depot.items():
+            buckets = buckets_by_depot[depot_id]
             for vehicle in depot_vehicles:
                 routes.append(
                     _build_route(
@@ -619,6 +903,8 @@ def build_plan(
                             allow_drops=True,
                             road_distance_km=road_distance_km,
                             enforce_delivery_windows=enforce_delivery_windows,
+                            time_limit_seconds=per_solve,
+                            stats=stats,
                         ),
                         speed_kph_by_stop,
                         road_distance_km,
@@ -629,6 +915,7 @@ def build_plan(
         route_tuple = tuple(routes)
     else:
         buckets = _sweep_buckets(vehicles, list(orders), vehicles[0].start)
+        per_solve = _per_solve_limit(buckets)
         route_tuple = tuple(
             _build_route(
                 vehicle,
@@ -638,6 +925,8 @@ def build_plan(
                     speed_kph_by_stop,
                     max_stops_per_vehicle,
                     enforce_delivery_windows=enforce_delivery_windows,
+                    time_limit_seconds=per_solve,
+                    stats=stats,
                 ),
                 speed_kph_by_stop,
                 enforce_delivery_windows=enforce_delivery_windows,
@@ -660,12 +949,58 @@ def build_plan(
         max_stops_per_vehicle,
         enforce_delivery_windows=enforce_delivery_windows,
     )
+    _log_plan_quality(provisional, vehicles, orders, stats)
     return provisional.model_copy(
         update={
             "status": "VALIDATED" if not violations else "CANDIDATE",
             "hard_violations": violations,
         }
     )
+
+
+def _log_plan_quality(
+    plan: PlanVersion,
+    vehicles: tuple[Vehicle, ...],
+    orders: tuple[Order, ...],
+    stats: SolverStats,
+) -> None:
+    """Log how well this plan was solved and how it compares to naive greedy.
+
+    Emits, at INFO, the objective_cost, the greedy_baseline cost, the percent
+    improvement over that baseline, and the OR-Tools-vs-fallback route split so
+    a plan that was merely constructed greedily (rather than optimized) is
+    visible in the logs. Any fallback reasons are included so a silent
+    degradation is traceable. This is measurement only — it never changes the
+    plan — and is wrapped defensively so instrumentation can never break
+    planning.
+    """
+    try:
+        baseline_cost = greedy_baseline(vehicles, orders).objective_cost if orders else 0.0
+        improvement = (
+            (baseline_cost - plan.objective_cost) / baseline_cost * 100.0
+            if baseline_cost > 0
+            else 0.0
+        )
+        logger.info(
+            "plan quality: plan_id=%s cost=%.2f greedy_baseline=%.2f improvement=%.1f%% "
+            "routes_ortools=%d routes_fallback=%d",
+            plan.plan_id,
+            plan.objective_cost,
+            baseline_cost,
+            improvement,
+            stats.ortools,
+            stats.fallback,
+        )
+        if stats.fallback:
+            logger.warning(
+                "plan %s used nearest-neighbor for %d/%d route(s); reasons=%s",
+                plan.plan_id,
+                stats.fallback,
+                stats.total,
+                ", ".join(sorted(set(stats.fallback_reasons))),
+            )
+    except Exception as exc:  # instrumentation must never break planning
+        logger.debug("plan quality logging skipped: %s", exc)
 
 
 def greedy_baseline(vehicles: tuple[Vehicle, ...], orders: tuple[Order, ...]) -> PlanVersion:

@@ -226,10 +226,92 @@ class PostgresRepository:
                 messages.append(ConversationMessage.model_validate(values))
             return tuple(messages)
 
+    async def recent_conversation_messages(
+        self, conversation_id: str, limit: int = 10
+    ) -> tuple[ConversationMessage, ...]:
+        """Return the most recent non-expired messages for a conversation.
+
+        Ordered oldest-first (chronological) so the tuple can be fed directly to
+        the LLM router as prior context. ``limit`` caps how many recent turns are
+        loaded to keep the router prompt bounded.
+        """
+        statement = text(
+            """
+            SELECT message_id, conversation_id, role, content, trust_label,
+                   created_at, expires_at
+            FROM conversation_messages
+            WHERE conversation_id = :conversation_id
+              AND expires_at > now()
+            ORDER BY created_at DESC, message_id DESC
+            LIMIT :limit
+            """
+        )
+        async with self.engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    statement, {"conversation_id": conversation_id, "limit": limit}
+                )
+            ).mappings()
+            messages = []
+            for row in rows:
+                values = dict(row)
+                values["message_id"] = str(values["message_id"])
+                messages.append(ConversationMessage.model_validate(values))
+            # Loaded newest-first for the LIMIT; return chronological.
+            return tuple(reversed(messages))
+
     async def prune_expired_conversations(self) -> int:
         async with self.engine.begin() as connection:
             result = await connection.execute(
                 text("DELETE FROM conversation_messages WHERE expires_at <= now()")
+            )
+            return result.rowcount
+
+    async def prune_stale_memory(
+        self,
+        proposed_incident_lesson_max_age_days: int,
+        superseded_max_age_days: int,
+    ) -> int:
+        """Delete stale, inert rows from ``memory_items`` (the Postgres mirror
+        of :class:`MasterMemory`), keeping the two stores' contents in sync.
+
+        Mirrors :meth:`MasterMemory.prune_stale`'s two categories exactly —
+        uncurated auto-generated INCIDENT_LESSON proposals past their retention
+        window, and SUPERSEDED items of any kind past theirs. ``memory_items``
+        has no ``expires_at`` column (unlike ``conversation_messages``), so the
+        cutoff is computed from ``created_at`` at prune time rather than a
+        stored expiry.
+
+        Returns:
+            Total rows deleted across both categories.
+        """
+        statement = text(
+            """
+            DELETE FROM memory_items
+            WHERE (kind = 'INCIDENT_LESSON' AND status = 'PROPOSED'
+                   AND created_at <= now() - make_interval(days => :proposed_days))
+               OR (status = 'SUPERSEDED'
+                   AND created_at <= now() - make_interval(days => :superseded_days))
+            """
+        )
+        async with self.engine.begin() as connection:
+            result = await connection.execute(
+                statement,
+                {
+                    "proposed_days": proposed_incident_lesson_max_age_days,
+                    "superseded_days": superseded_max_age_days,
+                },
+            )
+            return result.rowcount
+
+    async def delete_conversation(self, conversation_id: str) -> int:
+        """Delete all messages for a conversation, returning the row count."""
+        async with self.engine.begin() as connection:
+            result = await connection.execute(
+                text(
+                    "DELETE FROM conversation_messages WHERE conversation_id = :cid"
+                ),
+                {"cid": conversation_id},
             )
             return result.rowcount
 
@@ -330,6 +412,37 @@ class PostgresRepository:
             INSERT INTO telegram_drivers(driver_id, suspended_at)
             VALUES (:driver_id, now())
             ON CONFLICT (driver_id) DO UPDATE SET suspended_at = EXCLUDED.suspended_at
+            """
+        )
+        async with self.engine.begin() as connection:
+            await connection.execute(statement, {"driver_id": driver_id})
+
+    async def reactivate_telegram_driver(self, driver_id: str) -> None:
+        """Clear a driver's suspension flag, keeping the binding intact."""
+        statement = text(
+            """
+            UPDATE telegram_drivers SET suspended_at = NULL WHERE driver_id = :driver_id
+            """
+        )
+        async with self.engine.begin() as connection:
+            await connection.execute(statement, {"driver_id": driver_id})
+
+    async def unlink_telegram_driver(self, driver_id: str) -> None:
+        """Clear a driver's Telegram binding so the id can be re-enrolled.
+
+        Nulls out the bound ``telegram_user_id`` (and the enrollment markers and
+        suspension flag) rather than deleting the row, keeping the driver id
+        present in the table for a clean future enrollment.
+        """
+        statement = text(
+            """
+            UPDATE telegram_drivers
+            SET telegram_user_id = NULL,
+                enrollment_digest = NULL,
+                enrollment_expires_at = NULL,
+                enrollment_used_at = NULL,
+                suspended_at = NULL
+            WHERE driver_id = :driver_id
             """
         )
         async with self.engine.begin() as connection:

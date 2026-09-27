@@ -1,195 +1,219 @@
 # MahJourney
 
-MahJourney is a risk-aware, auditable delivery-dispatch demonstrator for a synthetic Singapore fleet of 10 trucks and 40 stops. It maintains a living route plan that combines capacity and time-window optimization with LTA traffic, NEA weather, OneMap road geometry, deterministic autonomy policy, disruption simulation, bounded agents, and human approvals.
+MahJourney is an AI-assisted delivery planning and dispatch system for Singapore logistics. It builds the daily delivery schedule, assigns customer orders to available vehicles and drivers, and keeps that schedule workable as traffic, weather, and order volume change during the day.
 
-The project is built as a modular monolith for a 2-vCPU/4-GB AWS Lightsail target:
+## The problem
 
-- React, TypeScript, Vinext/Vite, and MapLibre GL JS operator dashboard.
-- Python 3.12, FastAPI, LangGraph, OR-Tools, and NumPy backend.
-- PostgreSQL with PostGIS and pgvector.
-- A separate durable collector worker backed by PostgreSQL jobs.
-- Caddy as the public reverse proxy.
+Logistics coordinators prepare daily delivery schedules by assigning customer orders to available vehicles and drivers. Routes are planned manually while weighing customer locations, delivery windows, vehicle capacities, and traffic conditions. As delivery volumes increase, planning becomes increasingly difficult, producing inefficient routes and higher transportation costs.
 
-This is a hackathon demonstrator, not a production fleet-control system. The included fleet, orders, drivers, and truck movement are synthetic. Voice, runtime BERT, live vehicle telematics, and the 2D mascot are intentionally excluded.
+Manual planning breaks down in three ways:
 
-## What is implemented
+- The number of feasible order-to-vehicle assignments grows far faster than a planner can evaluate by hand.
+- Constraints interact. A change that fixes one delivery window can break a capacity limit or a driver's working hours elsewhere in the schedule.
+- A plan drawn in the morning goes stale. Incidents, congestion, rain, urgent orders, and breakdowns invalidate its assumptions once vehicles are on the road.
 
-- A validated 10-truck/40-stop OR-Tools plan with immutable versions and deltas.
-- Selected-leg driving geometry from OneMap, displayed on OneMap Night tiles.
-- LTA incidents, VMS, Speed Bands v4, and estimated-travel-time collectors.
-- NEA five-minute rainfall and two-hour forecast collectors.
-- Live and deterministic scenario modes with seeking, replay, and branching.
-- Road closure, urgent order, truck breakdown, and heavy-rain disruptions.
-- Deterministic three-tier autonomy policy with fail-closed behavior.
-- Four bounded LangGraph roles and six versioned skills.
-- Master-only curated memory, pgvector/full-text retrieval, and a 30-day conversation archive.
-- Telegram driver enrollment and driver-scoped access boundaries.
-- x401 0.1.0 demo approvals with proof binding and replay protection.
-- HMAC-linked audit events and an audit verifier.
-- A 24-case golden, disruption, and adversarial evaluation harness.
+## How MahJourney addresses it
 
-## Route computation
+| Coordinator problem | What the system does |
+|---|---|
+| Assigning orders to vehicles and drivers by hand | Generates candidate day plans with an OR-Tools solver across multiple depots, assigning each order to a specific vehicle and driver |
+| Holding capacity, delivery window, and shift rules in your head | Enforces weight and volume capacity, delivery windows, working hours, and stops per vehicle as explicit constraints, and surfaces any violation as evidence |
+| Estimating travel time from experience | Prices legs on OneMap road distance, adjusted by live LTA speed bands and estimated travel times rather than straight-line guesses |
+| No way to tell a good schedule from a bad one | Scores every plan on total route distance and compares it against a greedy baseline, so the cost improvement is measurable |
+| Replanning from scratch when the day goes wrong | Road-closure, heavy-rain, urgent-order, and breakdown workflows identify affected vehicles and propose a targeted reroute instead of a full replan |
+| Getting the revised schedule to drivers | Versions and activates plans, then dispatches driver-scoped routes over Telegram |
+| Accountability for schedule changes | Records who approved what, chained with HMACs and verifiable in the Operations workspace |
 
-MahJourney separates stop sequencing from road-path calculation:
+Planning is assistive, not automatic. The system proposes; the coordinator compares versions, activates one, then dispatches it.
 
-1. The planning cost matrix uses distance, road/traffic factors, and available LTA speed context.
-2. OR-Tools assigns stops to vehicles and determines their visit order while enforcing capacity and time-window constraints.
-3. The backend asks OneMap Routing for the driving geometry of each consecutive selected leg.
-4. MapLibre renders only geometry confirmed by OneMap.
-5. Scenario truck positions are interpolated along the persisted road geometry using scenario time.
+## Product highlights
 
-MahJourney does not implement Dijkstra directly. OneMap’s routing service performs the road-graph shortest-path work; OR-Tools solves the higher-level vehicle-routing problem.
+- Multi-depot order-to-vehicle-and-driver assignment with capacity, working-hour, stop-count, and delivery-window constraints.
+- Total-distance scoring for each plan with a greedy baseline comparison, so route efficiency gains are quantified.
+- OneMap road distance and geometry, with MapLibre fleet visualization.
+- LTA traffic incidents, VMS, speed bands, and estimated travel times applied to leg timing.
+- NEA rainfall and two-hour weather forecasts.
+- Interactive road-closure, heavy-rain, urgent-order, and vehicle-breakdown workflows.
+- A bounded supervisor-and-worker agent system with deterministic authority checks.
+- Versioned plans, plan comparison, explicit activation, and driver dispatch controls.
+- Telegram enrollment and driver-scoped route messaging.
+- Hands-free dispatcher voice input with transcription and streamed speech output.
+- HMAC-linked audit records, signed sessions, approval proof validation, and replay protection.
+- Persistent operational memory with PostgreSQL full-text and pgvector retrieval.
 
-OneMap calls are concurrency-limited, cached, and retried twice after transient request failures. A leg that still cannot be routed is not replaced by a straight coordinate line and is not presented as a valid road route. Authentication failures are not repeatedly retried.
+## Architecture
 
-The map’s coloured route overlay is distinct from the roads, expressways, and MRT lines baked into the OneMap base tiles. Truck markers are simulated positions, not live GPS reports.
+```text
+Browser
+  │
+  ▼
+Caddy ───────────────► Vinext / React operator UI
+  │
+  ├──────────────────► FastAPI application
+  │                       ├── LangGraph agent supervisor
+  │                       ├── OR-Tools route planner
+  │                       ├── policy, approval, and audit services
+  │                       └── OneMap / GraphHopper / Telegram clients
+  │
+  └──────────────────► WebSocket event and voice streams
 
-## Agents and authority boundaries
+FastAPI + collector worker ─► PostgreSQL + PostGIS + pgvector
+Collector worker ───────────► LTA DataMall + data.gov.sg
+```
 
-| Role | Responsibility | Explicit boundary |
-|---|---|---|
-| Master Dispatcher | Dispatcher contact, delegation, explanations, and curated memory | Cannot authorize actions, alter solver output, activate plans, or message drivers directly |
-| Route Planning | Planning, traffic/weather context, validation, and candidate evidence | Cannot approve or activate a plan |
-| Disruption Analyst | Determines affected legs and proposes bounded replanning | Cannot edit or approve a plan directly |
-| Driver Communications | Authenticated driver enquiries and approved notification drafts | Cannot reassign work or access another driver’s assignments |
+The application is deployed as a modular monolith with separate API, frontend, collector, database, routing, and reverse-proxy containers. PostgreSQL is the source of truth for fleet, order, plan, memory, approval, audit, and integration state.
 
-Authentication, policy decisions, optimization, simulation, audit verification, and x401 proof checks remain deterministic tools rather than LLM decisions. Worker agents never receive the master-memory object.
+## Quick start
 
-## Run locally
+### Prerequisites
 
-Requirements:
+Running the stack:
 
-- Docker Desktop with Docker Compose.
-- PowerShell for the supplied scripts.
-- `uv` and Node.js 22+ only when running tests directly on the host.
+- Docker Desktop or Docker Engine with Docker Compose v2
+- PowerShell 7+
 
-1. Create the local environment file without overwriting existing credentials:
+Only needed to run the checks in [Verification](#verification) outside containers:
 
-   ```powershell
-   Copy-Item .env.example .env
-   ```
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) for the backend test and lint commands
+- Node.js 22.13+ for the frontend lint and build commands
 
-2. Generate application secrets:
+### 1. Configure the environment
 
-   ```powershell
-   powershell -File scripts/generate-secrets.ps1
-   ```
+```powershell
+Copy-Item .env.example .env
+powershell -File scripts/generate-secrets.ps1
+```
 
-   The command writes ignored values to `.env.generated-secrets`. Copy those values into `.env`; the script never overwrites `.env`.
+Copy the generated values from `.env.generated-secrets` into the matching entries in `.env`. Then add an admin password hash:
 
-3. Add the external credentials you want to exercise:
+```powershell
+docker compose build api
+docker compose run --rm --no-deps api python -c "from mahjourney.auth import hash_password; print(hash_password('choose-a-strong-password'))"
+```
 
-   ```dotenv
-   OPENAI_API_KEY=
-   LTA_DATAMALL_ACCOUNT_KEY=
-   ONEMAP_ACCESS_TOKEN=
-   DATA_GOV_SG_API_KEY=
-   TELEGRAM_BOT_TOKEN=
-   TELEGRAM_BOT_USERNAME=
-   ```
+Paste the result into `ADMIN_PASSWORD_HASH`. Docker Compose interprets `$` in `.env` files, so replace each `$` in the hash with `$$`.
 
-4. Build and start the stack:
+Add credentials for the integrations you plan to use:
 
-   ```powershell
-   docker compose up -d --build
-   ```
+```dotenv
+OPENAI_API_KEY=
+LTA_DATAMALL_ACCOUNT_KEY=
+ONEMAP_ACCESS_TOKEN=
+DATA_GOV_SG_API_KEY=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_BOT_USERNAME=
+```
 
-5. Open the application:
+OneMap can also manage token refresh from `ONEMAP_API_EMAIL` and `ONEMAP_API_PASSWORD`.
 
-   - Dispatcher: `http://localhost/dispatcher`
-   - Scenario lab: `http://localhost/scenario`
-   - Operations: `http://localhost/operations`
-   - FastAPI documentation: `http://localhost:8000/docs`
+### 2. Start the platform
 
-6. Stop the stack without deleting PostgreSQL data:
+```powershell
+docker compose up -d --build
+```
 
-   ```powershell
-   docker compose down
-   ```
+On first startup, Compose creates the schema, imports the included Singapore logistics workbook, builds the GraphHopper road graph, and starts the application services. Graph preparation takes several minutes on its first run and is cached in a Docker volume.
 
-PostgreSQL data is stored in the `postgres-data` Docker volume. Do not add `--volumes` unless you intentionally want to remove it.
+Check startup progress with:
 
-## Environment contract
+```powershell
+docker compose ps
+docker compose logs -f data-init graphhopper api
+```
 
-See [`.env.example`](.env.example) for every supported value. The important external fields are:
+### 3. Open the application
 
-| Variable | Purpose | Required for fixture mode |
-|---|---|---|
-| `OPENAI_API_KEY` | Master-agent explanations through the Responses API | No |
-| `LTA_DATAMALL_ACCOUNT_KEY` | Traffic incidents, VMS, speed bands, and travel times | No |
-| `ONEMAP_ACCESS_TOKEN` | Search, driving routes, and road geometry | No |
-| `DATA_GOV_SG_API_KEY` | NEA rainfall and two-hour forecast access | No |
-| `TELEGRAM_BOT_TOKEN` | Telegram webhook and driver workflows | No |
-| `TELEGRAM_BOT_USERNAME` | Telegram enrollment links | No |
+| Surface | URL |
+|---|---|
+| Sign in | <http://localhost/login> |
+| Dispatcher | <http://localhost/dispatcher> |
+| Orders | <http://localhost/orders> |
+| Scenario lab | <http://localhost/scenario> |
+| Operations and audit | <http://localhost/operations> |
 
-Only `ONEMAP_ACCESS_TOKEN` is used for OneMap. The application never requests or stores a OneMap email/password and never calls `/api/auth/post/getToken`. The token remains server-side and is redacted from logs. A OneMap `401` disables subsequent live calls until the token is replaced and the integration is rechecked.
+Caddy proxies only `/api/*` and `/ws/*` to the API; every other path goes to the frontend. The generated API documentation is therefore not exposed through port 80. Reach it on the API port directly, after signing in at `/login`, since it requires an admin session:
 
-Safe defaults keep `TELEGRAM_SEND_TESTS=false`, `ALLOW_PLAN_EXECUTION_IN_TESTS=false`, `BERT_GUARD_ENABLED=false`, and `MASCOT_ENABLED=false`.
+| Surface | URL |
+|---|---|
+| Swagger UI | <http://localhost:8000/docs> |
+| ReDoc | <http://localhost:8000/redoc> |
+| OpenAPI schema | <http://localhost:8000/openapi.json> |
 
-## Admin access
+The normal operator flow is: generate a candidate plan, inspect the route and constraint evidence, activate the selected version, then dispatch it to enrolled drivers.
 
-Every route except `/health`, `/ready`, `/telegram/webhook`, and `/auth/*` requires a signed-in admin session. This exists so a public deployment can't have its OpenAI/OneMap/LTA/NEA/Telegram credentials spent by an anonymous visitor, and so plan activation and driver messaging stay dispatcher-only.
+### 4. Stop the platform
 
-There is a single shared admin credential (no per-user accounts). Set it via two environment variables:
+```powershell
+docker compose down
+```
+
+PostgreSQL and GraphHopper state remain in named volumes. Use `docker compose down --volumes` only when intentionally resetting local state.
+
+## Operational data
+
+The included workbook is mounted read-only and imported idempotently by the `data-init` service. To apply workbook changes later:
+
+```powershell
+powershell -File scripts/reimport.ps1 -Replace -AdminPassword 'your-admin-password'
+```
+
+See [Operational data guide](README.operational-data.md) for the workbook mapping and refresh workflow.
+
+## Telegram dispatch
+
+Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, and `TELEGRAM_WEBHOOK_SECRET`, then expose the API through your public HTTPS domain. For a temporary tunnel:
+
+```powershell
+docker compose --profile tunnel up -d ngrok
+powershell -File scripts/set-telegram-webhook.ps1
+```
+
+The dispatcher can issue an enrollment link for a driver. After enrollment, route messages remain scoped to that driver's assignment and are sent only through explicit dispatch actions.
+
+## Configuration
+
+[`.env.example`](.env.example) is the configuration contract. The most important deployment values are:
 
 | Variable | Purpose |
 |---|---|
-| `ADMIN_USERNAME` | Login username. Defaults to `admin`. |
-| `ADMIN_PASSWORD_HASH` | A salted PBKDF2 hash of the admin password. Never put a plaintext password here. |
-| `SESSION_TTL_MINUTES` | How long a login stays valid before requiring sign-in again. Defaults to 720 (12 hours). |
+| `APP_ENV` | Runtime mode; use `production` for a public deployment |
+| `APP_PUBLIC_URL` | Public application URL used for webhook registration |
+| `APP_PUBLIC_HOST` | Caddy site address, such as `dispatch.example.com` |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated browser origins allowed by the API |
+| `ADMIN_PASSWORD_HASH` | PBKDF2 hash used for dispatcher sign-in |
+| `DATABASE_URL` | Async PostgreSQL connection string |
+| `OPENAI_API_KEY` | Agent routing, response generation, embeddings, and voice |
+| `ONEMAP_ACCESS_TOKEN` | Singapore road routing and geometry |
+| `LTA_DATAMALL_ACCOUNT_KEY` | Traffic incidents and traffic conditions |
+| `DATA_GOV_SG_API_KEY` | Rainfall and forecast feeds |
+| `TELEGRAM_BOT_TOKEN` | Driver enrollment and dispatch messaging |
+| `GRAPHHOPPER_PROFILE` | Road profile used for closure-aware reroutes |
 
-Generate a password hash (run once, then paste the output into `.env`):
+Production mode validates persistent storage, the admin password hash, and generated application secrets before accepting traffic.
 
-```powershell
-docker compose exec api python -c "from mahjourney.auth import hash_password; print(hash_password('your-password'))"
-```
+## Security and control model
 
-The hash contains `$` characters. Because Docker Compose treats `.env` as subject to variable interpolation, every `$` in the value must be escaped as `$$` when pasted into `.env`, or Compose will silently blank the value out:
+- Every operator API route and generated API document requires a signed admin session.
+- Session cookies are `HttpOnly`, `SameSite=Lax`, and `Secure` in production.
+- Sign-in is throttled per source IP, rejecting further attempts with `429` after five failures in a minute, and every failure is audited.
+- Worker-agent actions pass versioned capability contracts before reaching the supervisor.
+- Agents propose plan and communication actions; deterministic policy and explicit operator actions control execution.
+- Telegram webhooks use Telegram's secret-token header.
+- Sensitive values are server-side and redacted from application logs.
+- Audit entries are chained with HMACs and can be verified from the Operations screen.
+- Direct service ports bind to loopback; Caddy is the public entry point.
+- Backend and frontend containers run as non-root users.
 
-```dotenv
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD_HASH=pbkdf2_sha256$$260000$$<salt>$$<hash>
-SESSION_TTL_MINUTES=720
-```
+## Verification
 
-Rebuild and restart the `api` service after changing either value:
-
-```powershell
-docker compose up -d --build api
-```
-
-Sign in at `http://localhost/login` (or your public domain once deployed). A session is a signed, `HttpOnly` cookie — it cannot be read or forged from JavaScript, and `main.py` verifies its signature and expiry on every protected request via the `require_admin` dependency. Logging in from repeated failed attempts from the same source IP is throttled (locked out for 60 seconds after 5 failures) to slow down credential stuffing against the login endpoint itself.
-
-In production (`APP_ENV=production`), the app refuses to start if `ADMIN_PASSWORD_HASH` is unset — the same validator that already requires generated (non-default) secrets and PostgreSQL persistence.
-
-`/docs`, `/redoc`, and `/openapi.json` (FastAPI's auto-generated API documentation) are also behind the same login — they are re-registered explicitly with `require_admin` rather than left on FastAPI's defaults, since the schema they expose is a complete map of every endpoint and parameter.
-
-The `/ws/events` WebSocket stream (map heartbeat/events) is not currently gated by the session cookie — it only carries non-sensitive, non-costing operational status, so this was judged an acceptable gap rather than scope-expanding into WebSocket-specific auth. Everything that costs money (OpenAI, OneMap, LTA, NEA) or mutates dispatcher state (plan activation, Telegram dispatch, approvals, memory curation) is behind the login.
-
-## Live-data schedules
-
-| Source | Dataset | Poll interval | Stale after |
-|---|---|---:|---:|
-| LTA | Traffic incidents | 120 seconds | 360 seconds |
-| LTA | VMS/EMAS | 120 seconds | 360 seconds |
-| LTA | Traffic Speed Bands v4 | 300 seconds | 900 seconds |
-| LTA | Estimated travel times | 300 seconds | 900 seconds |
-| NEA | Five-minute rainfall | 300 seconds | 900 seconds |
-| NEA | Two-hour forecast | 1,800 seconds | 3,600 seconds |
-
-LTA collection follows `$skip` pagination and retains the last valid snapshot after a failed fetch. The current v4 speed-band links are normalized into a PostGIS-indexed table while history retains compact hashes and counts.
-
-The weather-conditioned Markov model begins as `EXPERIMENTAL`. It remains outside operational decisions until at least 14 days of synchronized observations exist and it beats the required chronological persistence and traffic-only baselines.
-
-## Testing
-
-Run the backend suite:
+Backend tests and lint:
 
 ```powershell
 uv run --directory backend --group dev pytest -q
+uv run --directory backend --group dev ruff check mahjourney tests
 ```
 
-Run frontend validation:
+Frontend validation:
 
 ```powershell
 Set-Location frontend
@@ -198,67 +222,45 @@ npm run lint
 npm run build
 ```
 
-Run the container smoke workflow:
+Container smoke test:
 
 ```powershell
 powershell -File scripts/container-smoke.ps1
 ```
 
-The smoke workflow builds the stack, waits for readiness, verifies all three UI routes, checks the live map and evaluation API, verifies PostGIS/pgvector, and writes redacted artifacts under `artifacts/container-<timestamp>/`.
+The script prompts for the admin password. For unattended CI, provide it only in the process environment as `MAHJOURNEY_ADMIN_PASSWORD`. The smoke workflow checks readiness, authenticated operator routes, the active map contract, evaluation endpoints, and required PostgreSQL extensions, then writes redacted evidence under `artifacts/`.
 
-Run the unattended safety contract with:
+## Production deployment checklist
 
-```powershell
-powershell -File scripts/overnight.ps1
-```
-
-It runs fixture tests before optional read-only LTA, NEA, and OneMap checks. It never sends Telegram messages or activates a plan, continues independent suites after failures, redacts credentials, and writes timestamped test, coverage, build, audit, and live-read artifacts under `artifacts/`.
-
-Current local verification:
-
-- 56 backend tests passing.
-- 100% hard-constraint compliance across 24 evaluation scenarios.
-- 100% autonomy-policy compliance and zero infeasible automatic executions.
-- 31.1% median cost improvement over the greedy baseline.
-- 4.7% median disruption-duration improvement over traffic-free OR-Tools.
-- Frontend lint and production build passing.
-
-Evaluation figures are fixture-based hackathon evidence, not production performance guarantees.
-
-## Application and API entry points
-
-All entry points below require an admin session (see [Admin access](#admin-access)) except `/login`, `/health`, `/ready`, and `/telegram/webhook`.
-
-| Entry point | Purpose |
-|---|---|
-| `/login` | Admin sign-in page |
-| `/dispatcher` | Live fleet map, plan summary, alerts, assignments, approvals, and dispatcher console |
-| `/scenario` | Virtual clock, playback speeds, seeking, reset, branching, and disruption injection |
-| `/operations` | Data freshness, agent/policy trace, forecast gate, evaluations, and audit verification |
-| `/api/v1/auth/login` | Verify credentials and start a session |
-| `/api/v1/map/state` | Current plan and simulated truck positions |
-| `/api/v1/plans/generate` | Generate and road-enrich a candidate plan |
-| `/api/v1/plans/activate` | Activate a plan and dispatch it to enrolled drivers over Telegram |
-| `/api/v1/dispatcher/messages` | Submit dispatcher requests to the bounded agent graph |
-| `/api/v1/operations/integrations` | Integration health and freshness |
-| `/api/v1/evaluations/run` | Run the 24-case evaluation harness |
-| `/ws/events` | Live application events (not session-gated — see [Admin access](#admin-access)) |
-
-The complete REST contract is available from the generated FastAPI documentation.
+1. Set `APP_ENV=production`.
+2. Set `APP_PUBLIC_URL`, `APP_PUBLIC_HOST`, and `CORS_ALLOWED_ORIGINS` to the public HTTPS origin.
+3. Replace every generated-secret placeholder and set `ADMIN_PASSWORD_HASH`.
+4. Configure the required external integration credentials.
+5. Point DNS at the host and allow inbound TCP 80/443 for Caddy certificate provisioning.
+6. Keep PostgreSQL and GraphHopper volumes on durable storage and back up `postgres-data`.
+7. Run the backend, frontend, and container smoke checks before rollout.
+8. Verify `/api/v1/ready`, sign-in, plan generation, activation, and driver enrollment after deployment.
 
 ## Repository layout
 
 ```text
 backend/
-  mahjourney/       FastAPI application, agents, planning, integrations, policy, and simulation
-  migrations/       PostgreSQL/PostGIS/pgvector schema migrations
-  skills/           Six versioned agent-skill contracts
-  tests/            Fixture, policy, security, integration, routing, and evaluation tests
+  mahjourney/       API, agents, planning, integrations, policy, and simulation
+  contracts/        Versioned agent capability contracts
+  migrations/       PostgreSQL, PostGIS, and pgvector schema
+  tests/            Unit, integration, resilience, and security tests
+database/            Database image and operational workbook
 frontend/
-  app/               Dispatcher, scenario, and operations routes
-  components/        Operator UI and MapLibre map
-database/            PostgreSQL image with PostGIS and pgvector
-scripts/             Secret generation, container smoke, and unattended validation
-compose.yaml         Five-service development/deployment stack
-Caddyfile            Public reverse proxy configuration
+  app/               Operator routes
+  components/        Shared UI and map components
+  hooks/             Voice, responsive, and browser integration hooks
+  lib/               API client and application context
+graphhopper/          Self-hosted road-routing configuration
+scripts/              Secrets, data refresh, smoke, and webhook utilities
+compose.yaml          Application stack
+Caddyfile             Public reverse proxy
 ```
+
+## Technology
+
+React 19 · TypeScript · Vinext · Vite · MapLibre GL JS · FastAPI · Python 3.12 · LangGraph · OpenAI · OR-Tools · PostgreSQL 16 · PostGIS · pgvector · GraphHopper · Caddy · Docker Compose

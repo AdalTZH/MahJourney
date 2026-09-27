@@ -1,0 +1,14 @@
+{
+  "name": "mahjourney-pdf-build",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "One-off toolchain: renders docs/*.md (including Mermaid diagrams) to PDF via local Chrome.",
+  "dependencies": {
+    "highlight.js": "11.11.1",
+    "markdown-it": "14.1.0",
+    "markdown-it-anchor": "9.2.0",
+    "mermaid": "11.4.1",
+    "puppeteer-core": "24.1.1"
+  }
+}

@@ -3,7 +3,14 @@ import pytest
 
 from mahjourney.config import Settings
 from mahjourney.domain import SnapshotStatus
-from mahjourney.integrations import LtaClient, OneMapClient, TelegramClient
+from mahjourney.integrations import (
+    LtaClient,
+    NeaClient,
+    OneMapClient,
+    TelegramClient,
+    summarize_traffic_conditions,
+    summarize_weather_conditions,
+)
 
 
 @pytest.mark.asyncio
@@ -125,3 +132,51 @@ async def test_telegram_send_message_retries_then_gives_up() -> None:
     assert await adapter.send_message(42, "hello") is False
     assert calls == 3
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_summarize_traffic_conditions_none_when_not_configured() -> None:
+    # No LTA key -> both datasets NOT_CONFIGURED -> summary is None (tool then
+    # reports "unavailable" rather than fabricating data).
+    lta = LtaClient(Settings(lta_datamall_account_key=""))
+    assert await summarize_traffic_conditions(lta) is None
+
+
+@pytest.mark.asyncio
+async def test_summarize_traffic_conditions_summarises_incidents() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "TrafficIncidents" in request.url.path:
+            return httpx.Response(
+                200,
+                json={"value": [{"Type": "Accident"}, {"Type": "Roadwork"}]},
+            )
+        return httpx.Response(200, json={"value": []})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    lta = LtaClient(Settings(lta_datamall_account_key="test-key"), client)
+    summary = await summarize_traffic_conditions(lta)
+    assert summary is not None
+    assert summary["source"] == "LTA DataMall"
+    assert summary["incident_count"] == 2
+    assert set(summary["incident_types_sample"]) == {"Accident", "Roadwork"}
+
+
+@pytest.mark.asyncio
+async def test_summarize_weather_conditions_detects_rain() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "rainfall" in request.url.path:
+            return httpx.Response(
+                200, json={"data": {"readings": [{"value": 1.2}, {"value": 0}]}}
+            )
+        return httpx.Response(
+            200,
+            json={"data": {"items": [{"area": "Jurong", "forecast": "Thundery Showers"}]}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    nea = NeaClient(Settings(), client)
+    summary = await summarize_weather_conditions(nea)
+    assert summary is not None
+    assert summary["rain_detected"] is True
+    assert summary["raining_station_count"] == 1
+    assert "Jurong" in summary["rain_forecast_areas_sample"]

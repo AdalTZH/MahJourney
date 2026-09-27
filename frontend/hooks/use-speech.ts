@@ -31,13 +31,14 @@ declare global {
 /**
  * Voice input/output for the dispatcher console.
  *
- * - `listen()` transcribes speech into `transcript` via the browser's
- *   SpeechRecognition, when available. Interim results update live; the
- *   caller decides what to do with the final transcript rather than this hook
- *   auto-submitting anything, since voice input should be reviewable before
- *   it triggers an action.
- * - `speak(text)` reads text aloud via SpeechSynthesis, which has much broader
- *   browser support than recognition, so it is offered independently.
+ * - `listen(onFinalResult, onError)` transcribes speech into `transcript` via
+ *   the browser's SpeechRecognition. Interim results update live; the caller
+ *   receives the final transcript via `onFinalResult` for auto-submission, and
+ *   `onError` for recoverable errors (e.g. no-speech timeout) so continuous
+ *   mode can decide whether to restart.
+ * - `speak(text, onDone)` reads text aloud via SpeechSynthesis. `onDone` fires
+ *   when the utterance ends (or is cancelled), letting continuous mode restart
+ *   the mic after the agent finishes speaking.
  */
 export function useSpeech() {
   const [listening, setListening] = useState(false);
@@ -45,13 +46,19 @@ export function useSpeech() {
   const [speaking, setSpeaking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  // Track the latest final text inside the closure so onend can read it even
+  // after the recognition instance is replaced.
+  const finalTextRef = useRef("");
 
   const recognitionSupported = typeof window !== "undefined" && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
   const synthesisSupported = typeof window !== "undefined" && "speechSynthesis" in window;
 
   useEffect(() => () => { recognitionRef.current?.stop(); window.speechSynthesis?.cancel(); }, []);
 
-  const listen = useCallback((onFinalResult?: (text: string) => void) => {
+  const listen = useCallback((
+    onFinalResult?: (text: string) => void,
+    onError?: (reason: "no-speech" | "error") => void,
+  ) => {
     if (!recognitionSupported) { setError("Voice input is not supported in this browser."); return; }
     const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!Recognition) return;
@@ -60,6 +67,7 @@ export function useSpeech() {
     recognition.interimResults = true;
     recognition.lang = "en-SG";
     let finalText = "";
+    finalTextRef.current = "";
     recognition.onresult = (event) => {
       let interim = "";
       finalText = "";
@@ -70,14 +78,21 @@ export function useSpeech() {
         if (result.isFinal) finalText += result[0].transcript;
         else interim += result[0].transcript;
       }
+      finalTextRef.current = finalText;
       setTranscript((finalText + interim).trim());
     };
-    recognition.onerror = () => { setError("Could not hear that clearly. Try again."); setListening(false); };
+    recognition.onerror = (event) => {
+      // "no-speech" is a normal timeout (silence), not a hard error; pass it
+      // to the caller so continuous mode can restart cleanly without showing
+      // an error banner.
+      const isNoSpeech = (event as unknown as { error?: string }).error === "no-speech";
+      if (!isNoSpeech) setError("Could not hear that clearly. Try again.");
+      setListening(false);
+      onError?.(isNoSpeech ? "no-speech" : "error");
+    };
     recognition.onend = () => {
       setListening(false);
-      // Hand the finalized transcript to the caller so it can auto-submit;
-      // the transcript state is left intact so the text stays visible.
-      const spoken = finalText.trim();
+      const spoken = finalTextRef.current.trim();
       if (spoken && onFinalResult) onFinalResult(spoken);
     };
     recognitionRef.current = recognition;
@@ -89,15 +104,20 @@ export function useSpeech() {
 
   const stopListening = useCallback(() => { recognitionRef.current?.stop(); setListening(false); }, []);
 
-  const speak = useCallback((text: string) => {
-    if (!synthesisSupported || !text.trim()) return;
+  const clearTranscript = useCallback(() => {
+    setTranscript("");
+    finalTextRef.current = "";
+  }, []);
+
+  const speak = useCallback((text: string, onDone?: () => void) => {
+    if (!synthesisSupported || !text.trim()) { onDone?.(); return; }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1.02;
     utterance.pitch = 0.95;
     utterance.onstart = () => setSpeaking(true);
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
+    utterance.onend = () => { setSpeaking(false); onDone?.(); };
+    utterance.onerror = () => { setSpeaking(false); onDone?.(); };
     window.speechSynthesis.speak(utterance);
   }, [synthesisSupported]);
 
@@ -114,6 +134,6 @@ export function useSpeech() {
     stopListening,
     speak,
     stopSpeaking,
-    clearTranscript: () => setTranscript(""),
+    clearTranscript,
   };
 }

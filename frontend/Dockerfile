@@ -6,5 +6,9 @@ COPY . .
 ARG NEXT_PUBLIC_API_BASE_URL=/api/v1
 ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
 RUN npm run build
+RUN mkdir -p /app/.wrangler /app/dist/server/.wrangler /app/node_modules/.mf \
+    && chown -R node:node /app/.wrangler /app/dist/server/.wrangler \
+        /app/node_modules/.mf /home/node
+USER node
 EXPOSE 3000
 CMD ["npm", "run", "start", "--", "--ip", "0.0.0.0", "--port", "3000"]

@@ -19,6 +19,50 @@ services:
     mem_limit: 1g
     restart: unless-stopped
 
+  data-init:
+    build: ./backend
+    command:
+      - python
+      - -m
+      - mahjourney.import_operational
+      - --workbook
+      - /data/Singapore_Logistics_Delivery_Planning_Dataset.xlsx
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mahjourney}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-mahjourney}
+    volumes:
+      - ./database/Singapore_Logistics_Delivery_Planning_Dataset.xlsx:/data/Singapore_Logistics_Delivery_Planning_Dataset.xlsx:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  graphhopper:
+    image: israelhikingmap/graphhopper:latest
+    # On first run, downloads the OSM extract (~239 MB) and preprocesses it
+    # into a graph (~2-5 min). Subsequent starts reuse the cached graph from
+    # the volume and are ready in seconds.
+    command: >
+      --url https://download.geofabrik.de/asia/malaysia-singapore-brunei-latest.osm.pbf
+      --input /data/malaysia-singapore-brunei-latest.osm.pbf
+      --graph-cache /data/graph-cache
+      --config /graphhopper/config.yml
+    volumes:
+      - graphhopper-data:/data
+      - ./graphhopper/config.yml:/graphhopper/config.yml:ro
+    ports: ["127.0.0.1:8989:8989"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8989/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+    environment:
+      JAVA_OPTS: "-Xmx1g -Xms512m"
+    cpus: 0.5
+    mem_limit: 1536m
+    restart: unless-stopped
+
   api:
     build: ./backend
     env_file: .env
@@ -27,15 +71,20 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-mahjourney}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-mahjourney}
       PERSISTENCE_ENABLED: "true"
-      APP_SESSION_SECRET: ${APP_SESSION_SECRET:-development-only-session-secret}
-      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-development-only-webhook-secret}
-      ENROLLMENT_TOKEN_PEPPER: ${ENROLLMENT_TOKEN_PEPPER:-development-only-enrollment-pepper}
-      AUDIT_CHAIN_HMAC_KEY: ${AUDIT_CHAIN_HMAC_KEY:-development-only-audit-key}
-      APPROVAL_ACTION_HMAC_KEY: ${APPROVAL_ACTION_HMAC_KEY:-development-only-approval-key}
+      APP_SESSION_SECRET: ${APP_SESSION_SECRET:?set APP_SESSION_SECRET in .env}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:?set TELEGRAM_WEBHOOK_SECRET in .env}
+      ENROLLMENT_TOKEN_PEPPER: ${ENROLLMENT_TOKEN_PEPPER:?set ENROLLMENT_TOKEN_PEPPER in .env}
+      AUDIT_CHAIN_HMAC_KEY: ${AUDIT_CHAIN_HMAC_KEY:?set AUDIT_CHAIN_HMAC_KEY in .env}
+      APPROVAL_ACTION_HMAC_KEY: ${APPROVAL_ACTION_HMAC_KEY:?set APPROVAL_ACTION_HMAC_KEY in .env}
+      GRAPHHOPPER_BASE_URL: "http://graphhopper:8989"
     depends_on:
       db:
         condition: service_healthy
-    ports: ["8000:8000"]
+      data-init:
+        condition: service_completed_successfully
+      graphhopper:
+        condition: service_healthy
+    ports: ["127.0.0.1:8000:8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/ready', timeout=3)"]
       interval: 10s
@@ -55,6 +104,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      data-init:
+        condition: service_completed_successfully
     cpus: 0.4
     mem_limit: 512m
     restart: unless-stopped
@@ -66,7 +117,7 @@ services:
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api/v1}
     environment:
       NEXT_PUBLIC_API_BASE_URL: /api/v1
-    ports: ["3000:3000"]
+    ports: ["127.0.0.1:3000:3000"]
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/dispatcher').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
       interval: 10s
@@ -95,7 +146,24 @@ services:
     mem_limit: 128m
     restart: unless-stopped
 
+  ngrok:
+    image: ngrok/ngrok:latest
+    profiles: ["tunnel"]
+    command: http host.docker.internal:8000 --log stdout
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports: ["127.0.0.1:4040:4040"]
+    depends_on:
+      api:
+        condition: service_healthy
+    cpus: 0.1
+    mem_limit: 128m
+    restart: unless-stopped
+
 volumes:
   postgres-data:
+  graphhopper-data:
   caddy-data:
   caddy-config:

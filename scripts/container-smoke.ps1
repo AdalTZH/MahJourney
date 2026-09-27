@@ -1,3 +1,7 @@
+param(
+  [string]$AdminPassword = $env:MAHJOURNEY_ADMIN_PASSWORD
+)
+
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $generatedSecretsPath = Join-Path $root '.env.generated-secrets'
@@ -9,6 +13,20 @@ if (-not (Test-Path $generatedSecretsPath)) {
 foreach ($line in Get-Content $generatedSecretsPath) {
   $name, $value = $line -split '=', 2
   [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+}
+
+if (-not $AdminPassword) {
+  $securePassword = Read-Host 'Admin password for the smoke test' -AsSecureString
+  $credential = [System.Management.Automation.PSCredential]::new('admin', $securePassword)
+  $AdminPassword = $credential.GetNetworkCredential().Password
+}
+
+$adminUsername = 'admin'
+foreach ($line in Get-Content (Join-Path $root '.env')) {
+  if ($line -match '^ADMIN_USERNAME=(.*)$') {
+    $adminUsername = $Matches[1]
+    break
+  }
 }
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -33,11 +51,18 @@ try {
   }
   if (-not $ready) { throw 'MahJourney did not become ready within 60 seconds.' }
 
+  Invoke-RestMethod http://localhost/api/v1/auth/login -Method Post `
+    -ContentType 'application/json' `
+    -Body (@{ username = $adminUsername; password = $AdminPassword } | ConvertTo-Json) `
+    -SessionVariable adminSession -TimeoutSec 10 | Out-Null
+
   $dispatcher = Invoke-WebRequest http://localhost/dispatcher -UseBasicParsing -TimeoutSec 15
   $scenario = Invoke-WebRequest http://localhost/scenario -UseBasicParsing -TimeoutSec 15
   $operations = Invoke-WebRequest http://localhost/operations -UseBasicParsing -TimeoutSec 15
-  $map = Invoke-RestMethod http://localhost/api/v1/map/state -TimeoutSec 15
-  $evaluation = Invoke-RestMethod -Method Post http://localhost/api/v1/evaluations/run -TimeoutSec 30
+  $map = Invoke-RestMethod http://localhost/api/v1/map/state `
+    -WebSession $adminSession -TimeoutSec 15
+  $evaluation = Invoke-RestMethod -Method Post http://localhost/api/v1/evaluations/run `
+    -WebSession $adminSession -TimeoutSec 180
   $database = docker compose exec -T db psql -U mahjourney -d mahjourney -Atc `
     "SELECT string_agg(extname, ',') FROM pg_extension WHERE extname IN ('postgis','vector'); SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
 

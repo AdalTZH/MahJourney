@@ -1,12 +1,19 @@
 {$APP_PUBLIC_HOST:http://localhost} {
-    encode zstd gzip
-    handle /api/* {
-        reverse_proxy api:8000
-    }
-    handle /ws/* {
-        reverse_proxy api:8000
-    }
-    handle {
-        reverse_proxy frontend:3000
-    }
+	encode zstd gzip
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "camera=(), geolocation=(), microphone=(self), payment=()"
+	}
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	handle /ws/* {
+		reverse_proxy api:8000
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
 }

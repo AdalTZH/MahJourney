@@ -283,7 +283,108 @@ class AgentResult(FrozenModel):
     task_id: str
     status: Literal["COMPLETED", "NEEDS_INPUT", "FAILED", "ESCALATED"]
     evidence_references: tuple[str, ...] = ()
-    computed_metrics: dict[str, float | int | str | bool] = Field(default_factory=dict)
+    computed_metrics: dict[str, float | int | str | bool | None] = Field(default_factory=dict)
     proposed_actions: tuple[dict[str, Any], ...] = ()
     warnings: tuple[str, ...] = ()
     escalation_reason: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Master-agent explicit state & memory management
+# ---------------------------------------------------------------------------
+
+
+class TurnPhase(StrEnum):
+    """Explicit lifecycle phases for a single dispatcher turn.
+
+    The master agent transitions through these phases in order. Having an
+    explicit enum means every node can read and assert the current phase, and
+    the API layer can surface a machine-readable phase to the UI without
+    parsing free-text status strings.
+
+    IDLE          No in-flight turn.
+    ROUTING       Supervisor is deciding which workers to call.
+    WORKER_RUN    A worker node is actively executing.
+    SYNTHESIZING  Synthesize/respond node is composing the final reply.
+    DONE          Turn complete; result available.
+    ERROR         Unrecoverable error during the turn.
+    """
+
+    IDLE = "IDLE"
+    ROUTING = "ROUTING"
+    WORKER_RUN = "WORKER_RUN"
+    SYNTHESIZING = "SYNTHESIZING"
+    DONE = "DONE"
+    ERROR = "ERROR"
+
+
+class StateTransition(FrozenModel):
+    """An immutable record of one phase change within a turn.
+
+    Accumulated on GraphState so every turn carries a complete audit trail of
+    what the master agent decided and when, without touching the external
+    AuditChain (which is reserved for operator-visible events).
+    """
+
+    from_phase: TurnPhase
+    to_phase: TurnPhase
+    node: str
+    reason: str = ""
+    timestamp: datetime = Field(default_factory=utc_now)
+
+
+class MasterAgentState(BaseModel):
+    """Cross-turn state snapshot for the master agent.
+
+    Kept on AppState and updated at the start and end of every dispatcher turn
+    so operators and the UI can always observe what the agent is currently doing
+    without inspecting the raw LangGraph state.
+
+    ``current_phase`` is the only mutable field that changes during a turn.
+    Everything else is the immutable identity / provenance of the last completed
+    turn and is replaced atomically when a turn finishes.
+    """
+
+    # Current lifecycle phase — updated in real time.
+    current_phase: TurnPhase = TurnPhase.IDLE
+
+    # Identity of the last (or in-flight) turn.
+    conversation_id: str = ""
+    task_id: str = ""
+    task_type: str = ""
+
+    # Workers that were planned / have run in the last turn.
+    planned_workers: tuple[str, ...] = ()
+    completed_workers: tuple[str, ...] = ()
+
+    # Memory recall summary for the last turn.
+    recall_count: int = 0
+    # How many new items were proposed to memory from the last turn's results.
+    memory_proposed_count: int = 0
+
+    # Timestamps for latency tracking.
+    turn_started_at: datetime | None = None
+    turn_finished_at: datetime | None = None
+
+    def start_turn(
+        self,
+        conversation_id: str,
+        task_id: str,
+        task_type: str,
+    ) -> None:
+        """Transition to ROUTING at the start of a new turn."""
+        self.current_phase = TurnPhase.ROUTING
+        self.conversation_id = conversation_id
+        self.task_id = task_id
+        self.task_type = task_type
+        self.planned_workers = ()
+        self.completed_workers = ()
+        self.recall_count = 0
+        self.memory_proposed_count = 0
+        self.turn_started_at = utc_now()
+        self.turn_finished_at = None
+
+    def finish_turn(self, phase: TurnPhase = TurnPhase.DONE) -> None:
+        """Transition to DONE (or ERROR) at the end of a turn."""
+        self.current_phase = phase
+        self.turn_finished_at = utc_now()

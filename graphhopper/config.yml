@@ -1,0 +1,82 @@
+graphhopper:
+
+  # OSM input file — set via command line or env; the Dockerfile places it here.
+  datareader.file: "/data/malaysia-singapore-brunei-latest.osm.pbf"
+
+  # Preprocessed graph cache.
+  graph.location: /data/graph-cache
+
+  # ── Profiles ────────────────────────────────────────────────────────────────
+  # car profile uses the built-in car.json as its base custom model (provides
+  # the required speed/priority rules).  Per-request custom_model additions
+  # (e.g. closure polygon blocks) are merged on top of this base at query time.
+  profiles:
+    - name: car
+      custom_model_files: [car.json]
+    # Delivery van. Reuses the built-in car custom model so no extra encoded
+    # values or graph re-import are needed. Behaviourally identical to `car`
+    # today; this exists so the routing profile matches the real fleet (vans)
+    # and gives a single place to layer real van constraints later (height /
+    # weight / width / truck-restricted roads) once those encoded values are
+    # added to graph.encoded_values.
+    - name: van
+      custom_model_files: [car.json]
+
+  # ── Speed / Hybrid mode ──────────────────────────────────────────────────────
+  # CH (Contraction Hierarchies) is deliberately left EMPTY.  CH gives fastest
+  # routing but blocks custom_model (flexible mode).  Without CH every request
+  # runs a flexible Dijkstra/A* search — fast enough for city-scale routing
+  # with only a handful of stops per reroute call.
+  profiles_ch: []
+
+  # LM (Landmarks) hybrid mode speeds up flexible routing significantly without
+  # blocking custom_model.  Prepare the car profile with default landmarks.
+  profiles_lm:
+    - profile: car
+    - profile: van
+
+  # ── Encoded values ───────────────────────────────────────────────────────────
+  # Full set from the official config-example.yml — covers car.json and the
+  # custom_model area feature without needing to guess which values car.json needs.
+  graph.encoded_values: |
+    car_access, car_average_speed, country, road_class, roundabout, max_speed,
+    road_environment, ferry_speed
+
+  # ── Routing limits ───────────────────────────────────────────────────────────
+  # Cap flexible-mode search so a misconfigured request can't hang the server.
+  routing.max_visited_nodes: 1000000
+  routing.non_ch.max_waypoint_distance: 1000000
+
+  # ── Import ───────────────────────────────────────────────────────────────────
+  # Skip non-motorised highways — smaller graph, faster prep.
+  import.osm.ignored_highways: footway,cycleway,path,steps,pedestrian
+
+  # Keep everything in RAM for fast routing.
+  graph.dataaccess.default_type: RAM
+
+  # No elevation needed — skip the SRTM download.
+  # graph.elevation.provider: srtm
+
+  prepare.min_network_size: 200
+  prepare.subnetworks.threads: 1
+
+# ── Dropwizard HTTP server ────────────────────────────────────────────────────
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      # Bind to all interfaces so Docker's bridge network can reach us.
+      bind_host: 0.0.0.0
+      max_request_header_size: 50k
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
+  request_log:
+    appenders: []
+
+logging:
+  appenders:
+    - type: console
+      time_zone: UTC
+      log_format: "%d{HH:mm:ss.SSS} %-5level %logger{30} - %msg%n"

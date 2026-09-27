@@ -2,6 +2,16 @@ from mahjourney.dispatch import format_route_message
 from mahjourney.domain import Coordinate, Order, PlanVersion, RouteStop, Vehicle, VehicleRoute
 
 
+def _single(messages: list[str]) -> str:
+    """Assert the schedule fit in one Telegram message and return it.
+
+    Normal-sized routes must be delivered as a single message so the driver
+    isn't spammed with one notification per stop.
+    """
+    assert len(messages) == 1, f"expected one message, got {len(messages)}"
+    return messages[0]
+
+
 def _stop(stop_id: str, sequence: int, eta_minute: int) -> RouteStop:
     return RouteStop(
         stop_id=stop_id,
@@ -52,7 +62,7 @@ def test_format_route_message_renders_stop_table_fields() -> None:
             license_plate="SGX1234A",
         ),
     )
-    message = format_route_message(route, orders, _plan((route,)), fleet)
+    message = _single(format_route_message(route, orders, _plan((route,)), fleet))
     assert "Vehicle SGX1234A" in message
     assert "1 hr 35 min" in message
     assert "<pre>" in message and "</pre>" in message
@@ -73,7 +83,7 @@ def test_format_route_message_falls_back_to_coordinates_without_order() -> None:
         distance_km=5.0,
         duration_minutes=45,
     )
-    message = format_route_message(route, (), _plan((route,)))
+    message = _single(format_route_message(route, (), _plan((route,))))
     assert "Vehicle TRK-02" in message
     assert "45 min" in message
     assert "S1" in message
@@ -96,7 +106,7 @@ def test_format_route_message_escapes_html_special_characters() -> None:
             customer_name="A & B Pte Ltd",
         ),
     )
-    message = format_route_message(route, orders, _plan((route,)))
+    message = _single(format_route_message(route, orders, _plan((route,))))
     assert "<5>" not in message
     assert "&lt;5&gt;" in message
     assert "A &amp; B Pte Ltd" in message
@@ -110,6 +120,66 @@ def test_format_duration_hours_only() -> None:
         distance_km=1.0,
         duration_minutes=120,
     )
-    message = format_route_message(route, (), _plan((route,)))
+    message = _single(format_route_message(route, (), _plan((route,))))
     assert "2 hr" in message
     assert "2 hr 0 min" not in message
+
+
+def test_multi_stop_route_is_delivered_as_one_message() -> None:
+    stops = tuple(_stop(f"ORD-{i}", i, 480 + i * 10) for i in range(1, 6))
+    route = VehicleRoute(
+        vehicle_id="TRK-05",
+        driver_id="DRV-05",
+        stops=stops,
+        distance_km=30.0,
+        duration_minutes=180,
+    )
+    orders = tuple(
+        Order(
+            order_id=f"ORD-{i}",
+            address=f"{i} Example Ave",
+            location=Coordinate(lat=1.32, lon=103.7),
+            customer_name=f"Customer {i}",
+            quantity=i,
+        )
+        for i in range(1, 6)
+    )
+    message = _single(format_route_message(route, orders, _plan((route,))))
+    # Every stop is present in the single combined message.
+    for i in range(1, 6):
+        assert f"S{i}" in message
+        assert f"Order No. : ORD-{i}" in message
+
+
+def test_oversized_route_splits_across_messages_on_stop_boundaries() -> None:
+    # A large number of stops with long addresses forces the schedule past
+    # Telegram's 4096-char limit, so it must span more than one message.
+    long_address = "A very long delivery address that eats characters " * 3
+    stops = tuple(_stop(f"ORD-{i}", i, 480 + i) for i in range(1, 60))
+    route = VehicleRoute(
+        vehicle_id="TRK-06",
+        driver_id="DRV-06",
+        stops=stops,
+        distance_km=120.0,
+        duration_minutes=600,
+    )
+    orders = tuple(
+        Order(
+            order_id=f"ORD-{i}",
+            address=long_address,
+            location=Coordinate(lat=1.32, lon=103.7),
+            customer_name=f"Customer number {i}",
+            quantity=i,
+        )
+        for i in range(1, 60)
+    )
+    messages = format_route_message(route, orders, _plan((route,)))
+    assert len(messages) > 1
+    # No message exceeds Telegram's limit and no stop block is torn in half.
+    for msg in messages:
+        assert len(msg) <= 4096
+        assert msg.count("<pre>") == msg.count("</pre>")
+    # Every stop still appears somewhere across the messages.
+    combined = "\n".join(messages)
+    for i in range(1, 60):
+        assert f"Order No. : ORD-{i}" in combined

@@ -1,5 +1,8 @@
 node_modules
+.next
 .vinext
 dist
+.wrangler
+tsconfig.tsbuildinfo
 npm-debug.log
 

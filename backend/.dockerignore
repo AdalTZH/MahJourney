@@ -3,5 +3,8 @@ __pycache__
 .pytest_cache
 tests
 artifacts
+test_run_output.log
+$null
+*.log
 *.pyc
 

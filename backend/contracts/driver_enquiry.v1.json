@@ -1,7 +1,7 @@
 {
   "name": "driver_enquiry",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "agent": "driver-communications-agent",
-  "tools": ["authenticated_driver_assignment", "draft_reply"],
+  "tools": ["authenticated_driver_assignment", "draft_reply", "request_route_dispatch"],
   "forbidden": ["cross_driver_assignment", "approve_action", "activate_plan", "master_memory"]
 }

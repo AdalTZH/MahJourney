@@ -63,6 +63,49 @@ class EnrollmentService:
     def suspend(self, driver_id: str) -> None:
         self._suspended.add(driver_id)
 
+    def reactivate(self, driver_id: str) -> bool:
+        """Lift a suspension so the driver receives route messages again.
+
+        Keeps the existing Telegram binding intact. Returns whether the driver
+        was actually suspended (and is now reactivated).
+        """
+        if driver_id in self._suspended:
+            self._suspended.discard(driver_id)
+            return True
+        return False
+
+    def unlink(self, driver_id: str) -> bool:
+        """Remove a driver's Telegram binding entirely.
+
+        Unlike :meth:`suspend` (which keeps the binding but hides it), this
+        drops the driver-to-Telegram mapping so the driver id is free to be
+        enrolled again from scratch. Also clears any suspension flag. Returns
+        whether a binding was actually removed.
+        """
+        removed = False
+        for telegram_user_id, bound_driver_id in list(self._bindings.items()):
+            if bound_driver_id == driver_id:
+                del self._bindings[telegram_user_id]
+                removed = True
+        self._suspended.discard(driver_id)
+        return removed
+
+    def linked_drivers(self) -> tuple[dict[str, Any], ...]:
+        """List every driver currently bound to a Telegram account.
+
+        Returns one record per bound driver with its ``telegram_user_id`` and
+        whether the binding is currently ``suspended`` (still bound, but not
+        receiving messages).
+        """
+        records: dict[str, dict[str, Any]] = {}
+        for telegram_user_id, driver_id in self._bindings.items():
+            records[driver_id] = {
+                "driver_id": driver_id,
+                "telegram_user_id": telegram_user_id,
+                "suspended": driver_id in self._suspended,
+            }
+        return tuple(records[key] for key in sorted(records))
+
     def restore(self, records: tuple[dict[str, Any], ...]) -> None:
         """Rehydrate pending enrollments, bound drivers, and suspensions.
 

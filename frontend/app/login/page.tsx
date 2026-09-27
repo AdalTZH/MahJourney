@@ -2,7 +2,7 @@
 
 import { RadioTower } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { type FormEvent, useState } from "react";
+import { type SyntheticEvent, useEffect, useState } from "react";
 import { fetchSessionStatus, login } from "@/lib/api";
 
 export default function LoginPage() {
@@ -12,7 +12,7 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  const onSubmit = async (event: FormEvent) => {
+  const onSubmit = async (event: SyntheticEvent<HTMLFormElement>) => {
     event.preventDefault();
     setSubmitting(true);
     setError("");
@@ -27,11 +27,11 @@ export default function LoginPage() {
   };
 
   // Already logged in (e.g. reopened the tab) — skip straight past the form.
-  useState(() => {
+  useEffect(() => {
     void fetchSessionStatus().then((status) => {
       if (status.authenticated) router.push("/dispatcher");
     });
-  });
+  }, [router]);
 
   return (
     <div className="login-page">
@@ -44,7 +44,6 @@ export default function LoginPage() {
         <label>
           Username
           <input
-            autoFocus
             autoComplete="username"
             value={username}
             onChange={(event) => setUsername(event.target.value)}
